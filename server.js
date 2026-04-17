@@ -68,10 +68,43 @@ const supabaseAdmin =
 // Hosting behind reverse proxies (Render, etc.) so rate-limit uses correct IP.
 app.set('trust proxy', 1);
 
+/** Vercel + local dev. Set FRONTEND_URL (production site) and optional CORS_ORIGINS (comma-separated). */
+function buildAllowedCorsOrigins() {
+  const set = new Set([
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://dcrs-frontend-pearl.vercel.app',
+  ]);
+  const add = (s) => {
+    if (typeof s !== 'string') return;
+    const v = s.trim().replace(/\/$/, '');
+    if (v) set.add(v);
+  };
+  add(process.env.FRONTEND_URL);
+  (process.env.CORS_ORIGINS || '').split(',').forEach(add);
+  return [...set];
+}
+
+const allowedCorsOrigins = buildAllowedCorsOrigins();
+
 app.use(
   cors({
-    origin: ['http://localhost:3000', 'https://dcrs-frontend-pearl.vercel.app'],
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    origin(origin, callback) {
+      if (!origin) {
+        return callback(null, true);
+      }
+      if (allowedCorsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      if (
+        process.env.CORS_ALLOW_VERCEL_PREVIEWS === 'true' &&
+        /^https:\/\/[^\s/]+\.vercel\.app$/i.test(origin)
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, false);
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
     credentials: true,
   })
 );
