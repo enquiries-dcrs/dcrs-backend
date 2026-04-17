@@ -1,0 +1,65 @@
+-- Resident / clinical child data — invariants (documentation + optional hardening)
+--
+-- Application (server.js) enforces for GET /api/v1/residents/:id:
+--   tasks, daily_notes, medications, observations each JOIN service_users su
+--   ON su.id = <child>.service_user_id
+--   WHERE <child>.service_user_id = :residentId
+--     AND (viewer home_scope IS NULL OR su.home_id = viewer home_scope).
+--
+-- Offline sync ADD_NOTE uses INSERT ... SELECT ... FROM service_users su WHERE ...
+-- so the row is only inserted when the resident remains in the staff member’s scope.
+--
+-- =============================================================================
+-- 1) Pre-flight: orphan rows (run in SQL editor; fix data before adding FKs)
+-- =============================================================================
+-- Uncomment to execute:
+--
+-- SELECT 'daily_notes' AS tbl, COUNT(*) AS orphan_count
+-- FROM daily_notes dn
+-- LEFT JOIN service_users su ON su.id = dn.service_user_id
+-- WHERE su.id IS NULL;
+--
+-- SELECT 'tasks' AS tbl, COUNT(*) AS orphan_count
+-- FROM tasks t
+-- LEFT JOIN service_users su ON su.id = t.service_user_id
+-- WHERE su.id IS NULL;
+--
+-- SELECT 'medications' AS tbl, COUNT(*) AS orphan_count
+-- FROM medications m
+-- LEFT JOIN service_users su ON su.id = m.service_user_id
+-- WHERE su.id IS NULL;
+--
+-- SELECT 'observations' AS tbl, COUNT(*) AS orphan_count
+-- FROM observations o
+-- LEFT JOIN service_users su ON su.id = o.service_user_id
+-- WHERE su.id IS NULL;
+--
+-- If your table or column names differ, adjust before running.
+--
+-- =============================================================================
+-- 2) Optional: add FKs (one at a time; use CASCADE or SET NULL per retention policy)
+-- =============================================================================
+-- Uncomment ONLY after orphan_count = 0 for that table.
+-- ON DELETE CASCADE removes child rows when a service user row is removed — confirm policy first.
+--
+-- ALTER TABLE daily_notes
+--   ADD CONSTRAINT daily_notes_service_user_id_fkey
+--   FOREIGN KEY (service_user_id) REFERENCES service_users (id) ON DELETE CASCADE;
+--
+-- ALTER TABLE tasks
+--   ADD CONSTRAINT tasks_service_user_id_fkey
+--   FOREIGN KEY (service_user_id) REFERENCES service_users (id) ON DELETE CASCADE;
+--
+-- ALTER TABLE medications
+--   ADD CONSTRAINT medications_service_user_id_fkey
+--   FOREIGN KEY (service_user_id) REFERENCES service_users (id) ON DELETE CASCADE;
+--
+-- ALTER TABLE observations
+--   ADD CONSTRAINT observations_service_user_id_fkey
+--   FOREIGN KEY (service_user_id) REFERENCES service_users (id) ON DELETE CASCADE;
+--
+-- =============================================================================
+-- Operational checklist (non-SQL): see docs/CQC_OPERATIONAL_CHECKLIST.md
+-- =============================================================================
+
+SELECT 1 AS dcrs_resident_child_invariants_doc;
