@@ -1,6 +1,7 @@
 require('dotenv').config();
 const { randomUUID } = require('crypto');
 const express = require('express');
+const multer = require('multer');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { createClient } = require('@supabase/supabase-js');
@@ -65,6 +66,27 @@ const supabaseAdmin =
       })
     : null;
 
+/**
+ * Find a Supabase Auth user by email (case-insensitive), scanning listUsers pages.
+ * Returns null if deleted from Auth or not found (e.g. beyond scan limit).
+ */
+async function findSupabaseAuthUserByEmail(targetEmail) {
+  if (!supabaseAdmin || !targetEmail) return null;
+  const want = String(targetEmail).trim().toLowerCase();
+  let page = 1;
+  const perPage = 500;
+  for (let guard = 0; guard < 50; guard += 1) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    if (error) throw error;
+    const batch = data.users || [];
+    const found = batch.find((u) => (u.email || '').toLowerCase() === want);
+    if (found) return found;
+    if (!data.nextPage || batch.length === 0) return null;
+    page = data.nextPage;
+  }
+  return null;
+}
+
 // Hosting behind reverse proxies (Render, etc.) so rate-limit uses correct IP.
 app.set('trust proxy', 1);
 
@@ -110,6 +132,22 @@ app.use(
 );
 
 app.use(express.json({ limit: '2mb' }));
+
+const profilePhotoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    const allowed = new Set(['image/jpeg', 'image/png', 'image/webp']);
+    if (allowed.has(file.mimetype)) return cb(null, true);
+    cb(new Error('Only JPEG, PNG, or WebP images are allowed.'));
+  },
+});
+
+function extFromProfileMime(mime) {
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/webp') return 'webp';
+  return 'jpg';
+}
 
 // Correlation ID: structured logs + client support (no stack traces in JSON).
 app.use((req, res, next) => {
@@ -206,6 +244,26 @@ function userHomeScope(req) {
   return req.dbUser?.home_scope_id ?? null;
 }
 
+function normalizeTaskRow(t) {
+  if (!t || typeof t !== 'object') return t;
+  const due =
+    t.dueDate ??
+    t.due_date ??
+    t.due_at ??
+    t.dueAt ??
+    null;
+  const dueDate = due ? new Date(due).toLocaleDateString('en-GB') : (t.dueDate || t.due_date || null);
+  return {
+    id: t.id,
+    title: t.title ?? t.task_title ?? t.name ?? '',
+    status: t.status ?? t.task_status ?? 'Open',
+    priority: t.priority ?? t.task_priority ?? 'Normal',
+    dueDate,
+    // keep originals for debugging/compat without leaking unexpected columns
+    created_at: t.created_at ?? null,
+  };
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'DCRS Secured API is running!' });
 });
@@ -250,7 +308,7 @@ const authenticateToken = async (req, res, next) => {
     }
 
     const dbResult = await pool.query(
-      'SELECT id, email, system_role, home_scope_id, first_name, last_name, is_active FROM users WHERE email = $1',
+      'SELECT id, email, system_role, home_scope_id, first_name, last_name, is_active FROM users WHERE lower(trim(email)) = lower(trim($1))',
       [email]
     );
 
@@ -318,8 +376,32 @@ const ROLES_RESIDENT_AND_FACILITY_READ = [
 const ROLES_OFFLINE_SYNC_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 // NHS mock: same role set as routine clinical reads (no drift between lists).
 const ROLES_NHS_INTEGRATION_READ = ROLES_RESIDENT_AND_FACILITY_READ;
+const ROLES_TASKS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
+const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 
 app.use('/api/v1', authenticateToken);
+
+// Who is logged in (Postgres is source of truth for role — not Supabase user_metadata).
+app.get('/api/v1/auth/me', async (req, res) => {
+  try {
+    const u = req.dbUser;
+    if (!u) {
+      return clientError(req, res, 403, 'Account not provisioned.');
+    }
+    res.json({
+      id: u.id,
+      email: u.email,
+      first_name: u.first_name,
+      last_name: u.last_name,
+      system_role: u.system_role,
+      home_scope_id: u.home_scope_id,
+      is_active: u.is_active,
+    });
+  } catch (err) {
+    logRequestError(req, err, 'auth-me');
+    clientError(req, res, 500, 'Unable to load profile.');
+  }
+});
 
 // ---------------------------------------------------------------------------
 // AI SAFETY: Disabled in production by default
@@ -372,9 +454,14 @@ app.post(
         return res.status(400).json({ error: 'Missing email' });
       }
 
+      const normalizedEmail = String(email).trim().toLowerCase();
       const scopeId = homeScopeId === 'ALL' ? null : homeScopeId || null;
 
-      const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      const appOrigin = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
+      const inviteRedirectTo = `${appOrigin}/auth/callback`;
+
+      const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(normalizedEmail, {
+        redirectTo: inviteRedirectTo,
         data: {
           full_name: `${firstName || ''} ${lastName || ''}`.trim(),
           role: role || 'Carer',
@@ -388,14 +475,18 @@ app.post(
         `INSERT INTO users (email, password_hash, first_name, last_name, system_role, home_scope_id, is_active)
          VALUES ($1, 'invite_pending', $2, $3, $4, $5, true)
          ON CONFLICT (email) DO UPDATE
-         SET system_role = EXCLUDED.system_role, home_scope_id = EXCLUDED.home_scope_id`,
-        [email, firstName || '', lastName || '', role || 'Carer', scopeId]
+         SET system_role = EXCLUDED.system_role,
+             home_scope_id = EXCLUDED.home_scope_id,
+             first_name = EXCLUDED.first_name,
+             last_name = EXCLUDED.last_name,
+             is_active = true`,
+        [normalizedEmail, firstName || '', lastName || '', role || 'Carer', scopeId]
       );
 
       await writeAuditLog(req, {
         action: 'ADMIN_INVITE_USER',
         resourceType: 'user_email',
-        resourceId: String(email).trim(),
+        resourceId: normalizedEmail,
         metadata: { role: role || 'Carer', homeScopeAll: homeScopeId === 'ALL' },
       });
       res.json({ success: true, user: data.user });
@@ -425,9 +516,7 @@ app.put('/api/v1/admin/users/:id', requireRole(['Regional Manager', 'Admin']), a
 
     // 2. Update Supabase identity metadata (optional but keeps identity aligned)
     const userEmail = result.rows[0].email;
-    const { data: { users }, error } = await supabaseAdmin.auth.admin.listUsers();
-    if (error) throw error;
-    const sbUser = users.find((u) => u.email === userEmail);
+    const sbUser = await findSupabaseAuthUserByEmail(userEmail);
     if (sbUser) {
       await supabaseAdmin.auth.admin.updateUserById(sbUser.id, {
         user_metadata: { role, home_scope_id: scopeId },
@@ -457,11 +546,9 @@ app.post('/api/v1/admin/users/:id/deactivate', requireRole(['Regional Manager', 
     const result = await pool.query('UPDATE users SET is_active = false WHERE id = $1 RETURNING email', [id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'User not found' });
 
-    // 2. Suspend at identity level (prevents fresh token generation)
+    // 2. Suspend at identity level if they still exist in Supabase (already deleted → skip)
     const userEmail = result.rows[0].email;
-    const { data: { users }, error } = await supabaseAdmin.auth.admin.listUsers();
-    if (error) throw error;
-    const sbUser = users.find((u) => u.email === userEmail);
+    const sbUser = await findSupabaseAuthUserByEmail(userEmail);
     if (sbUser) {
       await supabaseAdmin.auth.admin.updateUserById(sbUser.id, { ban_duration: '876000h' });
     }
@@ -470,9 +557,14 @@ app.post('/api/v1/admin/users/:id/deactivate', requireRole(['Regional Manager', 
       action: 'ADMIN_DEACTIVATE_USER',
       resourceType: 'user',
       resourceId: id,
-      metadata: { targetEmail: userEmail },
+      metadata: { targetEmail: userEmail, supabaseUserFound: Boolean(sbUser) },
     });
-    res.json({ success: true, message: 'User securely deactivated.' });
+    res.json({
+      success: true,
+      message: sbUser
+        ? 'User securely deactivated in DCRS and Supabase.'
+        : 'User deactivated in DCRS. They were already removed from Supabase Auth.',
+    });
   } catch (err) {
     logRequestError(req, err, 'admin-deactivate-user');
     clientError(req, res, 500, 'Unable to deactivate user. Please try again later.');
@@ -480,7 +572,10 @@ app.post('/api/v1/admin/users/:id/deactivate', requireRole(['Regional Manager', 
 });
 
 // Password Resets
-app.post('/api/v1/admin/users/:id/reset-password', requireRole(['Regional Manager', 'Admin']), async (req, res) => {
+app.post(
+  '/api/v1/admin/users/:id/reset-password',
+  requireRole(['Regional Manager', 'Admin']),
+  async (req, res) => {
   const { id } = req.params;
   try {
     if (!supabaseAdmin) return clientError(req, res, 500, 'Server misconfiguration. Contact support.');
@@ -596,6 +691,196 @@ app.get('/api/v1/admin/audit-logs', requireRole(['Regional Manager', 'Admin']), 
   } catch (err) {
     logRequestError(req, err, 'admin-audit-logs');
     clientError(req, res, 500, 'Unable to load audit trail. Please try again later.');
+  }
+});
+
+function toCsvValue(v) {
+  if (v === null || v === undefined) return '';
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  // Escape double-quotes; wrap in quotes if it contains a special char.
+  const needsQuotes = /[",\n\r]/.test(s);
+  const escaped = s.replace(/"/g, '""');
+  return needsQuotes ? `"${escaped}"` : escaped;
+}
+
+function parseOptionalIsoTs(v) {
+  if (typeof v !== 'string' || v.trim() === '') return null;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString();
+}
+
+function computePeriodRange(period) {
+  const now = new Date();
+  const toTs = now.toISOString();
+  const p = typeof period === 'string' ? period.trim().toLowerCase() : '';
+
+  if (p === '7d' || p === 'last7' || p === 'last_7') {
+    const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    return { fromTs: from.toISOString(), toTs, label: 'Last 7 days' };
+  }
+  if (p === '28d' || p === 'last28' || p === 'last_28') {
+    const from = new Date(now.getTime() - 28 * 24 * 60 * 60 * 1000);
+    return { fromTs: from.toISOString(), toTs, label: 'Last 28 days' };
+  }
+  if (p === 'qtd' || p === 'quarter' || p === 'quarter_to_date') {
+    const start = new Date(Date.UTC(now.getUTCFullYear(), Math.floor(now.getUTCMonth() / 3) * 3, 1, 0, 0, 0));
+    return { fromTs: start.toISOString(), toTs, label: 'Quarter to date' };
+  }
+  const from = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  return { fromTs: from.toISOString(), toTs, label: 'Last 7 days' };
+}
+
+// ---------------------------------------------------------------------------
+// Audit trail export (governance evidence) — Regional Manager / Admin only
+// ---------------------------------------------------------------------------
+app.get('/api/v1/admin/audit-logs/export.csv', requireRole(['Regional Manager', 'Admin']), async (req, res) => {
+  try {
+    const actionFilter =
+      typeof req.query.action === 'string' && req.query.action.trim() !== ''
+        ? req.query.action.trim().slice(0, 128)
+        : null;
+    const fromTs = parseOptionalIsoTs(req.query.from);
+    const toTs = parseOptionalIsoTs(req.query.to);
+
+    const whereParts = [];
+    const params = [];
+    let p = 1;
+    if (actionFilter) {
+      whereParts.push(`action = $${p++}`);
+      params.push(actionFilter);
+    }
+    if (fromTs) {
+      whereParts.push(`occurred_at >= $${p++}::timestamptz`);
+      params.push(fromTs);
+    }
+    if (toTs) {
+      whereParts.push(`occurred_at < $${p++}::timestamptz`);
+      params.push(toTs);
+    }
+    const whereSql = whereParts.length ? whereParts.join(' AND ') : 'TRUE';
+
+    const { rows } = await pool.query(
+      `SELECT occurred_at, actor_email, actor_role, action, resource_type, resource_id, http_method, request_path, outcome, metadata
+       FROM public.audit_logs
+       WHERE ${whereSql}
+       ORDER BY occurred_at DESC
+       LIMIT 5000`,
+      params
+    );
+
+    await writeAuditLog(req, {
+      action: 'ADMIN_AUDIT_LOG_EXPORT_CSV',
+      resourceType: 'audit_logs',
+      metadata: {
+        exportedCount: rows.length,
+        hasActionFilter: Boolean(actionFilter),
+        hasDateFilter: Boolean(fromTs || toTs),
+      },
+    });
+
+    const header = [
+      'occurred_at',
+      'actor_email',
+      'actor_role',
+      'action',
+      'resource_type',
+      'resource_id',
+      'http_method',
+      'request_path',
+      'outcome',
+      'metadata',
+    ];
+    const lines = [header.join(',')];
+    for (const r of rows) {
+      const line = [
+        r.occurred_at,
+        r.actor_email,
+        r.actor_role,
+        r.action,
+        r.resource_type,
+        r.resource_id,
+        r.http_method,
+        r.request_path,
+        r.outcome,
+        r.metadata,
+      ]
+        .map(toCsvValue)
+        .join(',');
+      lines.push(line);
+    }
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="audit-logs-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.status(200).send(lines.join('\n'));
+  } catch (err) {
+    logRequestError(req, err, 'admin-audit-logs-export');
+    clientError(req, res, 500, 'Unable to export audit trail. Please try again later.');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Analytics (governance reporting) — real KPIs sourced from audit_logs + ops tables
+// ---------------------------------------------------------------------------
+app.get('/api/v1/analytics/summary', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  try {
+    const { fromTs, toTs, label } = computePeriodRange(req.query.period);
+    const scope = userHomeScope(req);
+
+    const [notes, residents, audits, topActions] = await Promise.all([
+      pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM public.daily_notes dn
+         INNER JOIN public.service_users su ON su.id = dn.service_user_id
+         WHERE dn.created_at >= $1::timestamptz AND dn.created_at < $2::timestamptz
+           AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+        [fromTs, toTs, scope]
+      ),
+      pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE status = 'ADMITTED')::int AS admitted,
+           COUNT(*) FILTER (WHERE status = 'DISCHARGED')::int AS discharged,
+           COUNT(*) FILTER (WHERE status = 'PENDING')::int AS pending
+         FROM public.service_users
+         WHERE (CAST($1 AS uuid) IS NULL OR home_id = CAST($1 AS uuid))`,
+        [scope]
+      ),
+      pool.query(
+        `SELECT
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE action LIKE 'AI_%')::int AS ai_actions,
+           COUNT(*) FILTER (WHERE outcome <> 'SUCCESS')::int AS non_success
+         FROM public.audit_logs
+         WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz`,
+        [fromTs, toTs]
+      ),
+      pool.query(
+        `SELECT action, COUNT(*)::int AS count
+         FROM public.audit_logs
+         WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz
+         GROUP BY action
+         ORDER BY COUNT(*) DESC
+         LIMIT 10`,
+        [fromTs, toTs]
+      ),
+    ]);
+
+    await writeAuditLog(req, {
+      action: 'ANALYTICS_SUMMARY_VIEW',
+      resourceType: 'analytics',
+      metadata: { periodLabel: label },
+    });
+
+    res.json({
+      period: { label, from: fromTs, to: toTs },
+      notesCreated: notes.rows[0]?.count ?? 0,
+      residents: residents.rows[0] ?? { admitted: 0, discharged: 0, pending: 0 },
+      audit: audits.rows[0] ?? { total: 0, ai_actions: 0, non_success: 0 },
+      topActions: topActions.rows ?? [],
+    });
+  } catch (err) {
+    logRequestError(req, err, 'analytics-summary');
+    clientError(req, res, 500, 'Unable to load analytics summary. Please try again later.');
   }
 });
 
@@ -756,7 +1041,7 @@ app.get(
       pool.query(obsQuery, [id, scope]),
     ]);
 
-    resident.tasks = tasksRes.rows;
+    resident.tasks = (tasksRes.rows || []).map(normalizeTaskRow);
     resident.dailyNotes = notesRes.rows.map((n) => ({
       id: n.id,
       text: n.note_text,
@@ -795,6 +1080,228 @@ app.get(
     logRequestError(req, err, 'resident-detail');
     clientError(req, res, 500, 'Unable to load resident record. Please try again later.');
   }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// TASKS (SCOPED TO RESIDENT + HOME)
+// ---------------------------------------------------------------------------
+app.post(
+  '/api/v1/residents/:id/tasks',
+  requireRole(ROLES_TASKS_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    const priority = typeof body.priority === 'string' ? body.priority.trim() : 'Normal';
+    const dueDateRaw = body.dueDate ?? body.due_date ?? null;
+
+    if (!title) return clientError(req, res, 400, 'Task title is required.');
+    if (title.length > 200) return clientError(req, res, 400, 'Task title is too long.');
+
+    let dueDate = null;
+    if (dueDateRaw) {
+      const d = new Date(String(dueDateRaw));
+      if (Number.isNaN(d.getTime())) return clientError(req, res, 400, 'dueDate must be a valid date.');
+      // tasks.due_date is a DATE (no time). Store as YYYY-MM-DD.
+      dueDate = d.toISOString().slice(0, 10);
+    }
+
+    try {
+      // Ensure resident exists and is in scope
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      // Insert into tasks table. Column names may vary across environments; try common DCRS schema.
+      // Expected columns: id uuid, service_user_id uuid, title text, status text, priority text, due_date timestamptz/date, created_at timestamptz
+      const ins = await pool.query(
+        `INSERT INTO tasks (service_user_id, title, status, priority, due_date)
+         VALUES ($1::uuid, $2, $3, $4, $5)
+         RETURNING *`,
+        [id, title, 'Open', priority || 'Normal', dueDate]
+      );
+
+      const row = ins.rows[0];
+      await writeAuditLog(req, {
+        action: 'TASK_CREATE',
+        resourceType: 'task',
+        resourceId: row?.id ?? null,
+        metadata: { serviceUserId: id, hasDueDate: Boolean(dueDate) },
+      });
+
+      res.status(201).json({ success: true, task: normalizeTaskRow(row) });
+    } catch (err) {
+      logRequestError(req, err, 'task-create');
+      clientError(req, res, 500, 'Could not create task. Please try again later.');
+    }
+  }
+);
+
+app.patch(
+  '/api/v1/residents/:id/tasks/:taskId',
+  requireRole(ROLES_TASKS_WRITE),
+  async (req, res) => {
+    const { id, taskId } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const status = typeof body.status === 'string' ? body.status.trim() : '';
+    if (!status) return clientError(req, res, 400, 'status is required.');
+
+    try {
+      // Update is scoped through service_users.home_id via join (defence in depth)
+      const up = await pool.query(
+        `UPDATE tasks t
+         SET status = $1
+         FROM service_users su
+         WHERE t.id = $2::uuid
+           AND t.service_user_id = $3::uuid
+           AND su.id = t.service_user_id
+           AND (CAST($4 AS uuid) IS NULL OR su.home_id = CAST($4 AS uuid))
+         RETURNING t.*`,
+        [status, taskId, id, scope]
+      );
+
+      if (up.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied or task not found.');
+      }
+
+      await writeAuditLog(req, {
+        action: 'TASK_UPDATE',
+        resourceType: 'task',
+        resourceId: taskId,
+        metadata: { serviceUserId: id, status },
+      });
+
+      res.json({ success: true, task: normalizeTaskRow(up.rows[0]) });
+    } catch (err) {
+      logRequestError(req, err, 'task-update');
+      clientError(req, res, 500, 'Could not update task. Please try again later.');
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// FOOD & DRINK CHART (DAILY, SCOPED)
+// ---------------------------------------------------------------------------
+app.get(
+  '/api/v1/residents/:id/food-drink',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const dateRaw = typeof req.query?.date === 'string' ? req.query.date : null; // YYYY-MM-DD
+
+    let chartDate = null;
+    if (dateRaw) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+        return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      }
+      chartDate = dateRaw;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const q = `
+        SELECT fde.*
+        FROM food_drink_entries fde
+        INNER JOIN service_users su ON su.id = fde.service_user_id
+        WHERE fde.service_user_id = $1::uuid
+          AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+          AND ($3::date IS NULL OR fde.chart_date = $3::date)
+        ORDER BY fde.created_at DESC
+      `;
+      const rows = (await pool.query(q, [id, scope, chartDate])).rows || [];
+
+      res.json({ date: chartDate, entries: rows });
+    } catch (err) {
+      logRequestError(req, err, 'food-drink-list');
+      clientError(req, res, 500, 'Unable to load food and drink chart.');
+    }
+  }
+);
+
+app.post(
+  '/api/v1/residents/:id/food-drink',
+  requireRole(ROLES_FOOD_DRINK_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const entryType = typeof body.entryType === 'string' ? body.entryType.trim().toUpperCase() : '';
+    const description = typeof body.description === 'string' ? body.description.trim() : '';
+    const amountMlRaw = body.amountMl ?? body.amount_ml ?? null;
+    const dateRaw = body.date ?? body.chartDate ?? body.chart_date ?? null; // YYYY-MM-DD
+
+    if (entryType !== 'FOOD' && entryType !== 'DRINK') {
+      return clientError(req, res, 400, 'entryType must be FOOD or DRINK.');
+    }
+    if (!description) return clientError(req, res, 400, 'description is required.');
+    if (description.length > 500) return clientError(req, res, 400, 'description is too long.');
+
+    let amountMl = null;
+    if (amountMlRaw !== null && amountMlRaw !== undefined && amountMlRaw !== '') {
+      const n = Number(amountMlRaw);
+      if (!Number.isFinite(n) || n < 0) return clientError(req, res, 400, 'amountMl must be a non-negative number.');
+      amountMl = Math.round(n);
+    }
+
+    let chartDate = null;
+    if (dateRaw) {
+      const s = String(dateRaw);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      chartDate = s;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const recordedBy =
+        (req.dbUser?.first_name || req.dbUser?.last_name)
+          ? `${req.dbUser?.first_name || ''} ${req.dbUser?.last_name || ''}`.trim()
+          : (req.dbUser?.email ?? req.user?.email ?? null);
+
+      const ins = await pool.query(
+        `INSERT INTO food_drink_entries (service_user_id, chart_date, entry_type, description, amount_ml, recorded_by)
+         VALUES ($1::uuid, COALESCE($2::date, (now() at time zone 'utc')::date), $3, $4, $5, $6)
+         RETURNING *`,
+        [id, chartDate, entryType, description, amountMl, recordedBy]
+      );
+
+      const row = ins.rows[0];
+      await writeAuditLog(req, {
+        action: 'FOOD_DRINK_ENTRY_CREATE',
+        resourceType: 'food_drink_entry',
+        resourceId: row?.id ?? null,
+        metadata: { serviceUserId: id, entryType, hasAmount: amountMl != null, date: row?.chart_date ?? null },
+      });
+
+      res.status(201).json({ success: true, entry: row });
+    } catch (err) {
+      logRequestError(req, err, 'food-drink-create');
+      clientError(req, res, 500, 'Could not add entry. Please try again later.');
+    }
   }
 );
 
@@ -848,6 +1355,99 @@ app.patch(
     } catch (err) {
       logRequestError(req, err, 'resident-profile-image');
       clientError(req, res, 500, 'Could not update profile photo. Please try again later.');
+    }
+  }
+);
+
+// Upload profile photo (camera / gallery) → Supabase Storage public URL stored on service_users.
+// Create a PUBLIC bucket named by SUPABASE_PROFILE_PHOTOS_BUCKET (default: service-user-profile-photos).
+app.post(
+  '/api/v1/residents/:id/profile-photo',
+  requireRole(ROLES_RESIDENT_MANAGEMENT),
+  (req, res, next) => {
+    profilePhotoUpload.single('photo')(req, res, (err) => {
+      if (err) {
+        if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+          return clientError(req, res, 400, 'Image must be 5MB or smaller.');
+        }
+        return clientError(req, res, 400, err.message || 'Invalid upload.');
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ error: 'Missing image file (field name: photo).' });
+    }
+    if (!supabaseAdmin) {
+      return clientError(req, res, 500, 'Server misconfiguration. Contact support.');
+    }
+
+    const bucket =
+      (process.env.SUPABASE_PROFILE_PHOTOS_BUCKET || 'service-user-profile-photos').trim() ||
+      'service-user-profile-photos';
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const ext = extFromProfileMime(req.file.mimetype);
+      const objectPath = `${id}/${randomUUID()}.${ext}`;
+
+      const { error: upErr } = await supabaseAdmin.storage.from(bucket).upload(objectPath, req.file.buffer, {
+        contentType: req.file.mimetype,
+        upsert: true,
+      });
+
+      if (upErr) {
+        const msg = upErr.message || String(upErr);
+        if (/not found|does not exist|Bucket/i.test(msg)) {
+          return clientError(
+            req,
+            res,
+            503,
+            `Storage bucket "${bucket}" is missing or not configured. Create a public bucket with this name in Supabase (Storage), then retry.`
+          );
+        }
+        logRequestError(req, upErr, 'resident-profile-photo-storage');
+        return clientError(req, res, 500, 'Could not upload photo to storage.');
+      }
+
+      const { data: pub } = supabaseAdmin.storage.from(bucket).getPublicUrl(objectPath);
+      const publicUrl = pub?.publicUrl;
+      if (!publicUrl) {
+        return clientError(req, res, 500, 'Could not resolve public URL for uploaded photo.');
+      }
+
+      const up = await pool.query(
+        `UPDATE service_users SET profile_image_url = $1
+         WHERE id = $2::uuid AND (CAST($3 AS uuid) IS NULL OR home_id = CAST($3 AS uuid))
+         RETURNING id`,
+        [publicUrl, id, scope]
+      );
+      if (up.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      await writeAuditLog(req, {
+        action: 'RESIDENT_PROFILE_PHOTO_UPLOAD',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { bucket, objectPath },
+      });
+
+      res.json({ success: true, profileImageUrl: publicUrl });
+    } catch (err) {
+      logRequestError(req, err, 'resident-profile-photo');
+      clientError(req, res, 500, 'Could not save profile photo. Please try again later.');
     }
   }
 );
