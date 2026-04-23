@@ -1244,6 +1244,7 @@ app.post(
     const body = req.body || {};
 
     const entryType = typeof body.entryType === 'string' ? body.entryType.trim().toUpperCase() : '';
+    const periodRaw = body.period ?? null;
     const description = typeof body.description === 'string' ? body.description.trim() : '';
     const amountMlRaw = body.amountMl ?? body.amount_ml ?? null;
     const dateRaw = body.date ?? body.chartDate ?? body.chart_date ?? null; // YYYY-MM-DD
@@ -1253,6 +1254,24 @@ app.post(
     }
     if (!description) return clientError(req, res, 400, 'description is required.');
     if (description.length > 500) return clientError(req, res, 400, 'description is too long.');
+
+    const allowedPeriods = new Set([
+      'Breakfast',
+      'Mid-morning',
+      'Lunch',
+      'Mid-Afternoon',
+      'Evening',
+      'Bedtime',
+    ]);
+    const period = typeof periodRaw === 'string' ? periodRaw.trim() : '';
+    if (!period || !allowedPeriods.has(period)) {
+      return clientError(
+        req,
+        res,
+        400,
+        'period is required and must be one of: Breakfast, Mid-morning, Lunch, Mid-Afternoon, Evening, Bedtime.'
+      );
+    }
 
     let amountMl = null;
     if (amountMlRaw !== null && amountMlRaw !== undefined && amountMlRaw !== '') {
@@ -1283,10 +1302,10 @@ app.post(
           : (req.dbUser?.email ?? req.user?.email ?? null);
 
       const ins = await pool.query(
-        `INSERT INTO food_drink_entries (service_user_id, chart_date, entry_type, description, amount_ml, recorded_by)
-         VALUES ($1::uuid, COALESCE($2::date, (now() at time zone 'utc')::date), $3, $4, $5, $6)
+        `INSERT INTO food_drink_entries (service_user_id, chart_date, period, entry_type, description, amount_ml, recorded_by)
+         VALUES ($1::uuid, COALESCE($2::date, (now() at time zone 'utc')::date), $3, $4, $5, $6, $7)
          RETURNING *`,
-        [id, chartDate, entryType, description, amountMl, recordedBy]
+        [id, chartDate, period, entryType, description, amountMl, recordedBy]
       );
 
       const row = ins.rows[0];
@@ -1294,7 +1313,7 @@ app.post(
         action: 'FOOD_DRINK_ENTRY_CREATE',
         resourceType: 'food_drink_entry',
         resourceId: row?.id ?? null,
-        metadata: { serviceUserId: id, entryType, hasAmount: amountMl != null, date: row?.chart_date ?? null },
+        metadata: { serviceUserId: id, entryType, period, hasAmount: amountMl != null, date: row?.chart_date ?? null },
       });
 
       res.status(201).json({ success: true, entry: row });
