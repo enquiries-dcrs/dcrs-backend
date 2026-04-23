@@ -1365,6 +1365,19 @@ app.get(
       const rows = (await pool.query(q, [id, scope, chartDate])).rows || [];
       res.json({ date: chartDate, entries: rows });
     } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        // Missing table migration
+        if (code === '42P01' || /activity_entries/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Activities chart is not available yet (database migration not applied). Run the activities SQL migration in Supabase and retry.'
+          );
+        }
+      }
       logRequestError(req, err, 'activities-list');
       clientError(req, res, 500, 'Unable to load activities chart.');
     }
@@ -1443,6 +1456,23 @@ app.post(
 
       res.status(201).json({ success: true, entry: row });
     } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        // Missing table migration
+        if (code === '42P01' || /activity_entries/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Activities chart is not available yet (database migration not applied). Run the activities SQL migration in Supabase and retry.'
+          );
+        }
+        // CHECK constraint violation
+        if (code === '23514') {
+          return clientError(req, res, 400, 'Invalid activityType (not allowed by database constraint).');
+        }
+      }
       logRequestError(req, err, 'activities-create');
       clientError(req, res, 500, 'Could not add activity entry. Please try again later.');
     }
