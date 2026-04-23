@@ -380,6 +380,7 @@ const ROLES_TASKS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
+const ROLES_PEEP_WRITE = ['Home Manager', 'Regional Manager', 'Admin'];
 
 app.use('/api/v1', authenticateToken);
 
@@ -1625,6 +1626,181 @@ app.post(
       }
       logRequestError(req, err, 'daily-care-create');
       clientError(req, res, 500, 'Could not add daily care entry. Please try again later.');
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// PEEP (PERSONAL EMERGENCY EVACUATION PLAN) — SCOPED
+// ---------------------------------------------------------------------------
+app.get(
+  '/api/v1/residents/:id/peep',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const q = `
+        SELECT pd.*
+        FROM peep_documents pd
+        INNER JOIN service_users su ON su.id = pd.service_user_id
+        WHERE pd.service_user_id = $1::uuid
+          AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+      `;
+      const r = await pool.query(q, [id, scope]);
+      const doc = r.rows[0] || null;
+      res.json({ peep: doc });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /peep_documents/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'PEEP document is not available yet (database migration not applied). Run the PEEP SQL migration in Supabase and retry.'
+          );
+        }
+      }
+      logRequestError(req, err, 'peep-get');
+      clientError(req, res, 500, 'Unable to load PEEP.');
+    }
+  }
+);
+
+app.put(
+  '/api/v1/residents/:id/peep',
+  requireRole(ROLES_PEEP_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const textOrNull = (v, max) => {
+      if (v === null || v === undefined) return null;
+      if (typeof v !== 'string') return null;
+      const s = v.trim();
+      if (!s) return null;
+      return s.length > max ? s.slice(0, max) : s;
+    };
+
+    const mobility = textOrNull(body.mobility, 1000);
+    const assistanceRequired = textOrNull(body.assistance_required ?? body.assistanceRequired, 1000);
+    const evacuationMethod = textOrNull(body.evacuation_method ?? body.evacuationMethod, 1000);
+    const alarmAwareness = textOrNull(body.alarm_awareness ?? body.alarmAwareness, 1000);
+    const communicationNeeds = textOrNull(body.communication_needs ?? body.communicationNeeds, 1000);
+    const nightArrangements = textOrNull(body.night_arrangements ?? body.nightArrangements, 1000);
+    const equipmentRequired = textOrNull(body.equipment_required ?? body.equipmentRequired, 1000);
+    const keyRisks = textOrNull(body.key_risks ?? body.keyRisks, 1500);
+    const routeAndRefuge = textOrNull(body.route_and_refuge ?? body.routeAndRefuge, 1500);
+    const otherNotes = textOrNull(body.other_notes ?? body.otherNotes, 1500);
+
+    let reviewDate = null;
+    const reviewRaw = body.review_date ?? body.reviewDate ?? null;
+    if (reviewRaw) {
+      const s = String(reviewRaw);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'reviewDate must be YYYY-MM-DD.');
+      reviewDate = s;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const updatedBy =
+        (req.dbUser?.first_name || req.dbUser?.last_name)
+          ? `${req.dbUser?.first_name || ''} ${req.dbUser?.last_name || ''}`.trim()
+          : (req.dbUser?.email ?? req.user?.email ?? null);
+
+      const up = await pool.query(
+        `INSERT INTO peep_documents (
+          service_user_id,
+          mobility,
+          assistance_required,
+          evacuation_method,
+          alarm_awareness,
+          communication_needs,
+          night_arrangements,
+          equipment_required,
+          key_risks,
+          route_and_refuge,
+          other_notes,
+          review_date,
+          updated_by,
+          updated_at
+        ) VALUES (
+          $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::date, $13, now()
+        )
+        ON CONFLICT (service_user_id) DO UPDATE SET
+          mobility = EXCLUDED.mobility,
+          assistance_required = EXCLUDED.assistance_required,
+          evacuation_method = EXCLUDED.evacuation_method,
+          alarm_awareness = EXCLUDED.alarm_awareness,
+          communication_needs = EXCLUDED.communication_needs,
+          night_arrangements = EXCLUDED.night_arrangements,
+          equipment_required = EXCLUDED.equipment_required,
+          key_risks = EXCLUDED.key_risks,
+          route_and_refuge = EXCLUDED.route_and_refuge,
+          other_notes = EXCLUDED.other_notes,
+          review_date = EXCLUDED.review_date,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = now()
+        RETURNING *`,
+        [
+          id,
+          mobility,
+          assistanceRequired,
+          evacuationMethod,
+          alarmAwareness,
+          communicationNeeds,
+          nightArrangements,
+          equipmentRequired,
+          keyRisks,
+          routeAndRefuge,
+          otherNotes,
+          reviewDate,
+          updatedBy,
+        ]
+      );
+
+      const doc = up.rows[0] || null;
+      await writeAuditLog(req, {
+        action: 'PEEP_UPDATE',
+        resourceType: 'peep_document',
+        resourceId: id,
+        metadata: { serviceUserId: id, hasReviewDate: Boolean(reviewDate) },
+      });
+
+      res.json({ success: true, peep: doc });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /peep_documents/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'PEEP document is not available yet (database migration not applied). Run the PEEP SQL migration in Supabase and retry.'
+          );
+        }
+      }
+      logRequestError(req, err, 'peep-put');
+      clientError(req, res, 500, 'Could not save PEEP. Please try again later.');
     }
   }
 );
