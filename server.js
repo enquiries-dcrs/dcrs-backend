@@ -379,6 +379,7 @@ const ROLES_NHS_INTEGRATION_READ = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_TASKS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
+const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 
 app.use('/api/v1', authenticateToken);
 
@@ -1475,6 +1476,155 @@ app.post(
       }
       logRequestError(req, err, 'activities-create');
       clientError(req, res, 500, 'Could not add activity entry. Please try again later.');
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// DAILY CARE RECORD (DAILY, SCOPED)
+// ---------------------------------------------------------------------------
+app.get(
+  '/api/v1/residents/:id/daily-care',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const dateRaw = typeof req.query?.date === 'string' ? req.query.date : null; // YYYY-MM-DD
+
+    let chartDate = null;
+    if (dateRaw) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+        return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      }
+      chartDate = dateRaw;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const q = `
+        SELECT dce.*
+        FROM daily_care_entries dce
+        INNER JOIN service_users su ON su.id = dce.service_user_id
+        WHERE dce.service_user_id = $1::uuid
+          AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+          AND ($3::date IS NULL OR dce.chart_date = $3::date)
+        ORDER BY dce.created_at DESC
+      `;
+      const rows = (await pool.query(q, [id, scope, chartDate])).rows || [];
+      res.json({ date: chartDate, entries: rows });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /daily_care_entries/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Daily care chart is not available yet (database migration not applied). Run the daily care SQL migration in Supabase and retry.'
+          );
+        }
+      }
+      logRequestError(req, err, 'daily-care-list');
+      clientError(req, res, 500, 'Unable to load daily care chart.');
+    }
+  }
+);
+
+app.post(
+  '/api/v1/residents/:id/daily-care',
+  requireRole(ROLES_DAILY_CARE_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const careItem = typeof body.careItem === 'string' ? body.careItem.trim() : '';
+    const value = typeof body.value === 'string' ? body.value.trim() : '';
+    const notes = typeof body.notes === 'string' ? body.notes.trim() : '';
+    const dateRaw = body.date ?? body.chartDate ?? body.chart_date ?? null; // YYYY-MM-DD
+
+    const allowed = new Set([
+      'Bath',
+      'Hair',
+      'Nails',
+      'Bowels Open',
+      'Fluids',
+      'Medicate',
+      'Visitors',
+      'Been out',
+      'Stayed in',
+      'Other',
+    ]);
+
+    if (!careItem || !allowed.has(careItem)) {
+      return clientError(req, res, 400, 'careItem must be one of the approved daily care items.');
+    }
+    if (value.length > 200) return clientError(req, res, 400, 'value is too long.');
+    if (notes.length > 2000) return clientError(req, res, 400, 'notes is too long.');
+
+    let chartDate = null;
+    if (dateRaw) {
+      const s = String(dateRaw);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      chartDate = s;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const recordedBy =
+        (req.dbUser?.first_name || req.dbUser?.last_name)
+          ? `${req.dbUser?.first_name || ''} ${req.dbUser?.last_name || ''}`.trim()
+          : (req.dbUser?.email ?? req.user?.email ?? null);
+
+      const ins = await pool.query(
+        `INSERT INTO daily_care_entries (service_user_id, chart_date, care_item, value, notes, recorded_by)
+         VALUES ($1::uuid, COALESCE($2::date, (now() at time zone 'utc')::date), $3, NULLIF($4, ''), NULLIF($5, ''), $6)
+         RETURNING *`,
+        [id, chartDate, careItem, value, notes, recordedBy]
+      );
+
+      const row = ins.rows[0];
+      await writeAuditLog(req, {
+        action: 'DAILY_CARE_ENTRY_CREATE',
+        resourceType: 'daily_care_entry',
+        resourceId: row?.id ?? null,
+        metadata: { serviceUserId: id, careItem, date: row?.chart_date ?? null },
+      });
+
+      res.status(201).json({ success: true, entry: row });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /daily_care_entries/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Daily care chart is not available yet (database migration not applied). Run the daily care SQL migration in Supabase and retry.'
+          );
+        }
+        if (code === '23514') {
+          return clientError(req, res, 400, 'Invalid careItem (not allowed by database constraint).');
+        }
+      }
+      logRequestError(req, err, 'daily-care-create');
+      clientError(req, res, 500, 'Could not add daily care entry. Please try again later.');
     }
   }
 );
