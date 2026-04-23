@@ -378,6 +378,7 @@ const ROLES_OFFLINE_SYNC_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_NHS_INTEGRATION_READ = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_TASKS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
+const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 
 app.use('/api/v1', authenticateToken);
 
@@ -1320,6 +1321,130 @@ app.post(
     } catch (err) {
       logRequestError(req, err, 'food-drink-create');
       clientError(req, res, 500, 'Could not add entry. Please try again later.');
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// ACTIVITIES CHART (DAILY, SCOPED)
+// ---------------------------------------------------------------------------
+app.get(
+  '/api/v1/residents/:id/activities',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const dateRaw = typeof req.query?.date === 'string' ? req.query.date : null; // YYYY-MM-DD
+
+    let chartDate = null;
+    if (dateRaw) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+        return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      }
+      chartDate = dateRaw;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const q = `
+        SELECT ae.*
+        FROM activity_entries ae
+        INNER JOIN service_users su ON su.id = ae.service_user_id
+        WHERE ae.service_user_id = $1::uuid
+          AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+          AND ($3::date IS NULL OR ae.chart_date = $3::date)
+        ORDER BY ae.created_at DESC
+      `;
+      const rows = (await pool.query(q, [id, scope, chartDate])).rows || [];
+      res.json({ date: chartDate, entries: rows });
+    } catch (err) {
+      logRequestError(req, err, 'activities-list');
+      clientError(req, res, 500, 'Unable to load activities chart.');
+    }
+  }
+);
+
+app.post(
+  '/api/v1/residents/:id/activities',
+  requireRole(ROLES_ACTIVITIES_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const activityType = typeof body.activityType === 'string' ? body.activityType.trim() : '';
+    const notes = typeof body.notes === 'string' ? body.notes.trim() : '';
+    const dateRaw = body.date ?? body.chartDate ?? body.chart_date ?? null; // YYYY-MM-DD
+
+    const allowed = new Set([
+      'Exercise class',
+      'Arts and Crafts',
+      'Puzzles',
+      'Watched television',
+      'Movie matinee',
+      'Gardening',
+      'Sitting in the garden',
+      'Pampering session',
+      'Bingo',
+      'Seasonal crafts',
+      'Reading',
+      'Social outings',
+      'Visitors',
+      'Dominoes',
+    ]);
+
+    if (!activityType || !allowed.has(activityType)) {
+      return clientError(req, res, 400, 'activityType must be one of the approved activity names.');
+    }
+    if (notes && notes.length > 1000) return clientError(req, res, 400, 'notes is too long.');
+
+    let chartDate = null;
+    if (dateRaw) {
+      const s = String(dateRaw);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      chartDate = s;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const recordedBy =
+        (req.dbUser?.first_name || req.dbUser?.last_name)
+          ? `${req.dbUser?.first_name || ''} ${req.dbUser?.last_name || ''}`.trim()
+          : (req.dbUser?.email ?? req.user?.email ?? null);
+
+      const ins = await pool.query(
+        `INSERT INTO activity_entries (service_user_id, chart_date, activity_type, notes, recorded_by)
+         VALUES ($1::uuid, COALESCE($2::date, (now() at time zone 'utc')::date), $3, NULLIF($4, ''), $5)
+         RETURNING *`,
+        [id, chartDate, activityType, notes, recordedBy]
+      );
+
+      const row = ins.rows[0];
+      await writeAuditLog(req, {
+        action: 'ACTIVITY_ENTRY_CREATE',
+        resourceType: 'activity_entry',
+        resourceId: row?.id ?? null,
+        metadata: { serviceUserId: id, activityType, date: row?.chart_date ?? null },
+      });
+
+      res.status(201).json({ success: true, entry: row });
+    } catch (err) {
+      logRequestError(req, err, 'activities-create');
+      clientError(req, res, 500, 'Could not add activity entry. Please try again later.');
     }
   }
 );
