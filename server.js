@@ -304,6 +304,90 @@ function normalizeTaskRow(t) {
   };
 }
 
+function normalizeObservationTypeCode(raw) {
+  const t = typeof raw === 'string' ? raw.trim() : '';
+  if (!t) return '';
+  const key = t.toLowerCase().replace(/\s+/g, ' ');
+  const map = new Map([
+    ['blood pressure', 'BP'],
+    ['bp', 'BP'],
+    ['heart rate', 'PULSE'],
+    ['pulse', 'PULSE'],
+    ['temperature', 'TEMP'],
+    ['temp', 'TEMP'],
+    ['weight', 'WEIGHT'],
+    ['spo2', 'SPO2'],
+    ['sp02', 'SPO2'],
+    ['oxygen saturation', 'SPO2'],
+    ['respiratory rate', 'RESP_RATE'],
+    ['resp rate', 'RESP_RATE'],
+    ['pain', 'PAIN'],
+  ]);
+  if (map.has(key)) return map.get(key);
+  const up = t.toUpperCase();
+  if (/^[A-Z][A-Z0-9_]*$/.test(up) && up.length <= 40) return up;
+  if (['BP', 'PULSE', 'TEMP', 'WEIGHT', 'SPO2', 'RESP_RATE', 'PAIN', 'OTHER'].includes(up)) return up;
+  return 'OTHER';
+}
+
+function defaultUnitForObservationCode(code) {
+  switch (code) {
+    case 'BP':
+      return 'mmHg';
+    case 'PULSE':
+      return 'bpm';
+    case 'TEMP':
+      return '°C';
+    case 'WEIGHT':
+      return 'kg';
+    case 'SPO2':
+      return '%';
+    case 'RESP_RATE':
+      return '/min';
+    case 'PAIN':
+      return '/10';
+    default:
+      return '';
+  }
+}
+
+function observationLabel(code) {
+  switch (code) {
+    case 'BP':
+      return 'Blood pressure';
+    case 'PULSE':
+      return 'Heart rate';
+    case 'TEMP':
+      return 'Temperature';
+    case 'WEIGHT':
+      return 'Weight';
+    case 'SPO2':
+      return 'SpO₂';
+    case 'RESP_RATE':
+      return 'Respiratory rate';
+    case 'PAIN':
+      return 'Pain';
+    default:
+      return code || 'Observation';
+  }
+}
+
+function mapObservationRow(o) {
+  const code = o.observation_type ?? o.type ?? '';
+  return {
+    id: o.id,
+    type: code,
+    typeLabel: observationLabel(code),
+    value: o.value != null ? String(o.value) : '',
+    unit: o.unit || '',
+    notes: o.notes ?? null,
+    recordedAt: o.recorded_at,
+    time: o.recorded_at ? new Date(o.recorded_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+    date: o.recorded_at ? new Date(o.recorded_at).toLocaleDateString() : '',
+    author: o.recorded_by_name || 'Staff',
+  };
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'DCRS Secured API is running!' });
 });
@@ -423,6 +507,7 @@ const ROLES_TASK_ASSIGN = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Re
 const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
+const ROLES_OBSERVATIONS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_PEEP_WRITE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_CARE_PLAN_EDIT = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_CARE_PLAN_ARCHIVE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
@@ -1157,14 +1242,7 @@ app.get(
       route: m.route,
       stockCount: m.stock_count,
     }));
-    resident.observations = obsRes.rows.map((o) => ({
-      type: o.observation_type,
-      value: o.value,
-      unit: o.unit,
-      time: new Date(o.recorded_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      date: new Date(o.recorded_at).toLocaleDateString(),
-      author: o.recorded_by_name || 'Staff',
-    }));
+    resident.observations = obsRes.rows.map((o) => mapObservationRow(o));
     resident.documents = [];
 
     await writeAuditLog(req, {
@@ -2422,6 +2500,166 @@ app.delete('/api/v1/documents/:docId', requireRole(ROLES_RESIDENT_DOCUMENTS_DELE
     clientError(req, res, 500, 'Could not delete document.');
   } finally {
     client.release();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// OBSERVATIONS (SCOPED) — Chunk E
+// ---------------------------------------------------------------------------
+
+app.get('/api/v1/residents/:id/observations', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  const sinceRaw = typeof req.query?.since === 'string' ? req.query.since.trim() : '';
+  let since = null;
+  if (sinceRaw) {
+    const d = new Date(sinceRaw);
+    if (Number.isNaN(d.getTime())) return clientError(req, res, 400, 'since must be a valid ISO date/time.');
+    since = d.toISOString();
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT o.*
+       FROM observations o
+       INNER JOIN service_users su ON su.id = o.service_user_id
+       WHERE o.service_user_id = $1::uuid
+         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+         AND ($3::timestamptz IS NULL OR o.recorded_at >= $3::timestamptz)
+       ORDER BY o.recorded_at DESC
+       LIMIT 2000`,
+      [id, scope, since]
+    );
+    await writeAuditLog(req, {
+      action: 'OBSERVATIONS_LIST_VIEW',
+      resourceType: 'service_user',
+      resourceId: id,
+      metadata: { resultCount: rows.length, hasSince: Boolean(since) },
+    });
+    res.json({ observations: rows.map((r) => mapObservationRow(r)) });
+  } catch (err) {
+    if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+      const code = err.code;
+      const msg = err.message || '';
+      if (code === '42P01' || /observations/i.test(String(msg))) {
+        return clientError(
+          req,
+          res,
+          503,
+          'Observations are not available yet (database table missing). Create the observations table in Supabase and retry.'
+        );
+      }
+    }
+    logRequestError(req, err, 'observations-list');
+    clientError(req, res, 500, 'Unable to load observations.');
+  }
+});
+
+app.get(
+  '/api/v1/residents/:id/observations/summary',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    try {
+      const { rows } = await pool.query(
+        `SELECT DISTINCT ON (o.observation_type) o.*
+         FROM observations o
+         INNER JOIN service_users su ON su.id = o.service_user_id
+         WHERE o.service_user_id = $1::uuid
+           AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+         ORDER BY o.observation_type, o.recorded_at DESC`,
+        [id, scope]
+      );
+      res.json({ latestByType: rows.map((r) => mapObservationRow(r)) });
+    } catch (err) {
+      logRequestError(req, err, 'observations-summary');
+      clientError(req, res, 500, 'Unable to load observation summary.');
+    }
+  }
+);
+
+app.post('/api/v1/residents/:id/observations', requireRole(ROLES_OBSERVATIONS_WRITE), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  const body = req.body || {};
+  const typeRaw = body.observationType ?? body.observation_type ?? body.type ?? '';
+  const typeCode = normalizeObservationTypeCode(String(typeRaw));
+  const valueRaw = body.value ?? body.value_text ?? '';
+  const value = typeof valueRaw === 'string' ? valueRaw.trim() : String(valueRaw ?? '').trim();
+  const unitRaw = body.unit != null && body.unit !== '' ? String(body.unit).trim() : defaultUnitForObservationCode(typeCode);
+  const notesRaw = body.notes != null ? String(body.notes).trim() : '';
+  const notes = notesRaw.length > 2000 ? notesRaw.slice(0, 2000) : notesRaw;
+  const recordedAtRaw = body.recordedAt ?? body.recorded_at ?? null;
+  let recordedAt = null;
+  if (recordedAtRaw) {
+    const d = new Date(String(recordedAtRaw));
+    if (Number.isNaN(d.getTime())) return clientError(req, res, 400, 'recordedAt must be a valid ISO date/time.');
+    recordedAt = d.toISOString();
+  }
+
+  if (!typeCode) {
+    return clientError(req, res, 400, 'type is required (e.g. Blood Pressure, BP, Temperature).');
+  }
+  if (!value) return clientError(req, res, 400, 'value is required.');
+
+  const recordedByName =
+    (req.dbUser?.first_name || req.dbUser?.last_name)
+      ? `${req.dbUser?.first_name || ''} ${req.dbUser?.last_name || ''}`.trim()
+      : (req.dbUser?.email ?? req.user?.email ?? 'Staff');
+
+  async function tryInsertObservation(includeNotes) {
+    if (includeNotes) {
+      return pool.query(
+        `INSERT INTO observations (service_user_id, observation_type, value, unit, recorded_at, recorded_by_name, notes)
+         SELECT $1::uuid, $2, $3, $4, COALESCE($5::timestamptz, now()), $6, $7
+         FROM service_users su
+         WHERE su.id = $1::uuid AND (CAST($8 AS uuid) IS NULL OR su.home_id = CAST($8 AS uuid))
+         RETURNING *`,
+        [id, typeCode, value, unitRaw || null, recordedAt, recordedByName, notes || null, scope]
+      );
+    }
+    return pool.query(
+      `INSERT INTO observations (service_user_id, observation_type, value, unit, recorded_at, recorded_by_name)
+       SELECT $1::uuid, $2, $3, $4, COALESCE($5::timestamptz, now()), $6
+       FROM service_users su
+       WHERE su.id = $1::uuid AND (CAST($7 AS uuid) IS NULL OR su.home_id = CAST($7 AS uuid))
+       RETURNING *`,
+      [id, typeCode, value, unitRaw || null, recordedAt, recordedByName, scope]
+    );
+  }
+
+  try {
+    let ins;
+    if (notes) {
+      try {
+        ins = await tryInsertObservation(true);
+      } catch (e1) {
+        const code = e1 && typeof e1 === 'object' ? e1.code : null;
+        const msg = e1 && typeof e1 === 'object' ? String(e1.message || '') : '';
+        if (code === '42703' || /notes/i.test(msg)) ins = await tryInsertObservation(false);
+        else throw e1;
+      }
+    } else {
+      ins = await tryInsertObservation(false);
+    }
+
+    if (ins.rows.length === 0) {
+      return clientError(req, res, 403, 'Access denied to this resident');
+    }
+
+    const row = ins.rows[0];
+    await writeAuditLog(req, {
+      action: 'OBSERVATION_CREATE',
+      resourceType: 'observation',
+      resourceId: row?.id ?? null,
+      metadata: { serviceUserId: id, observationType: typeCode, valueChars: value.length, hasNotes: Boolean(notes) },
+    });
+
+    res.status(201).json({ success: true, observation: mapObservationRow(row) });
+  } catch (err) {
+    logRequestError(req, err, 'observation-create');
+    clientError(req, res, 500, 'Could not save observation.');
   }
 });
 
