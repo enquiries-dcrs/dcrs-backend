@@ -368,6 +368,7 @@ const ROLES_RESIDENT_AND_FACILITY_READ = [
   'Carer',
   'Senior Carer',
   'Nurse',
+  'Deputy Manager',
   'Home Manager',
   'Regional Manager',
   'Admin',
@@ -380,7 +381,7 @@ const ROLES_TASKS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
-const ROLES_PEEP_WRITE = ['Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_PEEP_WRITE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 
 app.use('/api/v1', authenticateToken);
 
@@ -922,7 +923,7 @@ app.get(
   }
 );
 
-const ROLES_RESIDENT_MANAGEMENT = ['Regional Manager', 'Home Manager', 'Admin'];
+const ROLES_RESIDENT_MANAGEMENT = ['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin'];
 
 app.post(
   '/api/v1/residents',
@@ -1995,7 +1996,7 @@ app.get(
 // ---------------------------------------------------------------------------
 app.post(
   '/api/v1/residents/:id/transfer',
-  requireRole(['Regional Manager', 'Home Manager', 'Admin']),
+  requireRole(['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin']),
   async (req, res) => {
     const { id } = req.params;
     const { newBedId } = req.body;
@@ -2047,7 +2048,7 @@ app.post(
 
 app.post(
   '/api/v1/residents/:id/discharge',
-  requireRole(['Regional Manager', 'Home Manager', 'Admin']),
+  requireRole(['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin']),
   async (req, res) => {
     const { id } = req.params;
     const scope = userHomeScope(req);
@@ -2082,7 +2083,7 @@ app.post(
 
 app.post(
   '/api/v1/residents/:id/admit',
-  requireRole(['Regional Manager', 'Home Manager', 'Admin']),
+  requireRole(['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin']),
   async (req, res) => {
     const { id } = req.params;
     const { newBedId } = req.body || {};
