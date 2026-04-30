@@ -1107,9 +1107,21 @@ app.get(
       if (scopeCheck.rows.length === 0) return clientError(req, res, 403, 'Access denied to this resident');
 
       const plansRes = await pool.query(
-        `SELECT cp.id, cp.service_user_id, cp.title, cp.status, cp.created_by, cp.created_at, cp.updated_at
+        `SELECT
+           cp.id,
+           cp.service_user_id,
+           cp.title,
+           cp.status,
+           cp.created_by,
+           cp.updated_by,
+           cp.created_at,
+           cp.updated_at,
+           COALESCE(NULLIF(TRIM(CONCAT(uc.first_name, ' ', uc.last_name)), ''), uc.email) AS created_by_name,
+           COALESCE(NULLIF(TRIM(CONCAT(uu.first_name, ' ', uu.last_name)), ''), uu.email) AS updated_by_name
          FROM public.care_plans cp
          INNER JOIN public.service_users su ON su.id = cp.service_user_id
+         LEFT JOIN public.users uc ON uc.id = cp.created_by
+         LEFT JOIN public.users uu ON uu.id = cp.updated_by
          WHERE cp.service_user_id = $1::uuid
            AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
          ORDER BY (cp.status = 'ACTIVE') DESC, cp.updated_at DESC`,
@@ -1120,14 +1132,67 @@ app.get(
       let goalsByPlan = {};
       if (planIds.length > 0) {
         const goalsRes = await pool.query(
-          `SELECT g.id, g.care_plan_id, g.goal_text, g.target_date, g.status, g.created_by, g.created_at, g.updated_at
+          `SELECT
+             g.id,
+             g.care_plan_id,
+             g.goal_text,
+             g.target_date,
+             g.status,
+             g.created_by,
+             g.updated_by,
+             g.created_at,
+             g.updated_at,
+             COALESCE(NULLIF(TRIM(CONCAT(uc.first_name, ' ', uc.last_name)), ''), uc.email) AS created_by_name,
+             COALESCE(NULLIF(TRIM(CONCAT(uu.first_name, ' ', uu.last_name)), ''), uu.email) AS updated_by_name
            FROM public.care_plan_goals g
+           LEFT JOIN public.users uc ON uc.id = g.created_by
+           LEFT JOIN public.users uu ON uu.id = g.updated_by
            WHERE g.care_plan_id = ANY($1::uuid[])
            ORDER BY (g.status IN ('OPEN','IN_PROGRESS')) DESC, g.updated_at DESC`,
           [planIds]
         );
+
+        const goals = goalsRes.rows || [];
+        const goalIds = goals.map((g) => g.id);
+
+        // Linked tasks per goal (optional table; if missing, treat as none)
+        let tasksByGoal = {};
+        if (goalIds.length > 0) {
+          try {
+            const linksRes = await pool.query(
+              `SELECT
+                 l.goal_id,
+                 t.*
+               FROM public.care_plan_goal_tasks l
+               INNER JOIN public.tasks t ON t.id = l.task_id
+               INNER JOIN public.service_users su ON su.id = t.service_user_id
+               WHERE l.goal_id = ANY($1::uuid[])
+                 AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+               ORDER BY t.created_at DESC`,
+              [goalIds, scope]
+            );
+            tasksByGoal = (linksRes.rows || []).reduce((acc, row) => {
+              const gid = row.goal_id;
+              const task = normalizeTaskRow(row);
+              (acc[gid] ||= []).push(task);
+              return acc;
+            }, {});
+          } catch (e) {
+            // If migration not applied yet, don't fail the whole care plan list.
+            const code = e && typeof e === 'object' ? e.code : null;
+            const msg = e && typeof e === 'object' ? e.message : '';
+            if (code !== '42P01' && !/care_plan_goal_tasks/i.test(String(msg))) {
+              throw e;
+            }
+            tasksByGoal = {};
+          }
+        }
+
         goalsByPlan = goalsRes.rows.reduce((acc, row) => {
-          (acc[row.care_plan_id] ||= []).push(row);
+          (acc[row.care_plan_id] ||= []).push({
+            ...row,
+            linkedTasks: tasksByGoal[row.id] || [],
+          });
           return acc;
         }, {});
       }
@@ -1191,9 +1256,9 @@ app.post(
       }
 
       const ins = await client.query(
-        `INSERT INTO public.care_plans (service_user_id, title, status, created_by, created_at, updated_at)
-         VALUES ($1::uuid, $2, $3, $4::uuid, now(), now())
-         RETURNING id, service_user_id, title, status, created_by, created_at, updated_at`,
+        `INSERT INTO public.care_plans (service_user_id, title, status, created_by, updated_by, created_at, updated_at)
+         VALUES ($1::uuid, $2, $3, $4::uuid, $4::uuid, now(), now())
+         RETURNING id, service_user_id, title, status, created_by, updated_by, created_at, updated_at`,
         [id, title, status, req.dbUser?.id ?? null]
       );
       const newPlanId = ins.rows[0]?.id;
@@ -1271,13 +1336,14 @@ app.patch(
          SET
            title = COALESCE($1, cp.title),
            status = COALESCE($2, cp.status),
+           updated_by = $5::uuid,
            updated_at = now()
          FROM public.service_users su
          WHERE cp.id = $3::uuid
            AND su.id = cp.service_user_id
            AND (CAST($4 AS uuid) IS NULL OR su.home_id = CAST($4 AS uuid))
-         RETURNING cp.id, cp.service_user_id, cp.title, cp.status, cp.created_by, cp.created_at, cp.updated_at`,
-        [title, status, planId, scope]
+         RETURNING cp.id, cp.service_user_id, cp.title, cp.status, cp.created_by, cp.updated_by, cp.created_at, cp.updated_at`,
+        [title, status, planId, scope, req.dbUser?.id ?? null]
       );
       if (up.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -1351,13 +1417,13 @@ app.post(
 
     try {
       const ins = await pool.query(
-        `INSERT INTO public.care_plan_goals (care_plan_id, goal_text, target_date, status, created_by, created_at, updated_at)
-         SELECT cp.id, $1, $2::date, $3, $4::uuid, now(), now()
+        `INSERT INTO public.care_plan_goals (care_plan_id, goal_text, target_date, status, created_by, updated_by, created_at, updated_at)
+         SELECT cp.id, $1, $2::date, $3, $4::uuid, $4::uuid, now(), now()
          FROM public.care_plans cp
          INNER JOIN public.service_users su ON su.id = cp.service_user_id
          WHERE cp.id = $5::uuid
            AND (CAST($6 AS uuid) IS NULL OR su.home_id = CAST($6 AS uuid))
-         RETURNING id, care_plan_id, goal_text, target_date, status, created_by, created_at, updated_at`,
+         RETURNING id, care_plan_id, goal_text, target_date, status, created_by, updated_by, created_at, updated_at`,
         [goalText, targetDate, status, req.dbUser?.id ?? null, planId, scope]
       );
       if (ins.rows.length === 0) return clientError(req, res, 403, 'Access denied or care plan not found.');
@@ -1413,6 +1479,7 @@ app.patch(
            goal_text = COALESCE($1, g.goal_text),
            status = COALESCE($2, g.status),
            target_date = CASE WHEN $3::text IS NULL THEN g.target_date WHEN $3::text = '' THEN NULL ELSE $3::date END,
+           updated_by = $7::uuid,
            updated_at = now()
          FROM public.care_plans cp
          INNER JOIN public.service_users su ON su.id = cp.service_user_id
@@ -1420,8 +1487,8 @@ app.patch(
            AND g.care_plan_id = cp.id
            AND cp.id = $5::uuid
            AND (CAST($6 AS uuid) IS NULL OR su.home_id = CAST($6 AS uuid))
-         RETURNING g.id, g.care_plan_id, g.goal_text, g.target_date, g.status, g.created_by, g.created_at, g.updated_at`,
-        [goalText, status, targetDate, goalId, planId, scope]
+         RETURNING g.id, g.care_plan_id, g.goal_text, g.target_date, g.status, g.created_by, g.updated_by, g.created_at, g.updated_at`,
+        [goalText, status, targetDate, goalId, planId, scope, req.dbUser?.id ?? null]
       );
       if (up.rows.length === 0) return clientError(req, res, 403, 'Access denied or goal not found.');
 
@@ -1475,6 +1542,96 @@ app.delete(
     } catch (err) {
       logRequestError(req, err, 'care-goal-delete');
       clientError(req, res, 500, 'Could not delete goal.');
+    }
+  }
+);
+
+// Create a task from a care plan goal (and store the link)
+app.post(
+  '/api/v1/care-plans/:planId/goals/:goalId/tasks',
+  requireRole(ROLES_TASKS_WRITE),
+  async (req, res) => {
+    const { planId, goalId } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const priority = typeof body.priority === 'string' ? body.priority.trim() : 'Normal';
+    const dueDateRaw = body.dueDate ?? body.due_date ?? null;
+    let dueDate = null;
+    if (dueDateRaw) {
+      const d = new Date(String(dueDateRaw));
+      if (Number.isNaN(d.getTime())) return clientError(req, res, 400, 'dueDate must be a valid date.');
+      dueDate = d.toISOString().slice(0, 10);
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Scope check through plan→resident→home; also get goal text + resident id.
+      const goalRes = await client.query(
+        `SELECT g.goal_text, cp.service_user_id
+         FROM public.care_plan_goals g
+         INNER JOIN public.care_plans cp ON cp.id = g.care_plan_id
+         INNER JOIN public.service_users su ON su.id = cp.service_user_id
+         WHERE cp.id = $1::uuid
+           AND g.id = $2::uuid
+           AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+        [planId, goalId, scope]
+      );
+      if (goalRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return clientError(req, res, 403, 'Access denied or goal not found.');
+      }
+
+      const residentId = goalRes.rows[0].service_user_id;
+      const goalText = String(goalRes.rows[0].goal_text || '').trim().replace(/\s+/g, ' ');
+      const title = goalText.length > 180 ? `${goalText.slice(0, 177)}…` : goalText;
+      if (!title) {
+        await client.query('ROLLBACK');
+        return clientError(req, res, 400, 'Goal text is empty.');
+      }
+
+      const taskIns = await client.query(
+        `INSERT INTO tasks (service_user_id, title, status, priority, due_date)
+         VALUES ($1::uuid, $2, $3, $4, $5)
+         RETURNING *`,
+        [residentId, title, 'Open', priority || 'Normal', dueDate]
+      );
+      const taskRow = taskIns.rows[0];
+
+      await client.query(
+        `INSERT INTO public.care_plan_goal_tasks (goal_id, task_id, created_by)
+         VALUES ($1::uuid, $2::uuid, $3::uuid)
+         ON CONFLICT (goal_id, task_id) DO NOTHING`,
+        [goalId, taskRow?.id, req.dbUser?.id ?? null]
+      );
+
+      await client.query(`UPDATE public.care_plans SET updated_at = now(), updated_by = $2::uuid WHERE id = $1::uuid`, [
+        planId,
+        req.dbUser?.id ?? null,
+      ]);
+
+      await client.query('COMMIT');
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_GOAL_TASK_CREATE',
+        resourceType: 'task',
+        resourceId: taskRow?.id ?? null,
+        metadata: { carePlanId: planId, goalId },
+      });
+
+      res.status(201).json({ success: true, task: normalizeTaskRow(taskRow) });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        logRequestError(req, rollbackErr, 'care-goal-task-rollback');
+      }
+      logRequestError(req, err, 'care-goal-task-create');
+      clientError(req, res, 500, 'Could not create task from goal.');
+    } finally {
+      client.release();
     }
   }
 );
