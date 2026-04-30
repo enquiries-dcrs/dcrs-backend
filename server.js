@@ -1067,6 +1067,105 @@ app.get('/api/v1/analytics/summary', requireRole(ROLES_RESIDENT_AND_FACILITY_REA
 });
 
 // ---------------------------------------------------------------------------
+// Analytics — per-home (or estate) resident roster CSV
+// ---------------------------------------------------------------------------
+app.get('/api/v1/analytics/residents-export.csv', requireRole(ROLES_RESIDENT_RECORD_EXPORT), async (req, res) => {
+  const scope = userHomeScope(req);
+  const homeIdRaw = typeof req.query?.homeId === 'string' ? req.query.homeId.trim() : '';
+
+  let filterHomeId = null;
+  try {
+    if (scope != null) {
+      filterHomeId = scope;
+      if (homeIdRaw && homeIdRaw.toUpperCase() !== 'ALL') {
+        if (String(homeIdRaw).replace(/-/g, '').toLowerCase() !== String(scope).replace(/-/g, '').toLowerCase()) {
+          return clientError(req, res, 403, 'You can only export residents for your assigned home.');
+        }
+      }
+    } else {
+      if (!homeIdRaw || homeIdRaw.toUpperCase() === 'ALL') {
+        filterHomeId = null;
+      } else {
+        if (!/^[0-9a-f-]{36}$/i.test(homeIdRaw)) {
+          return clientError(req, res, 400, 'homeId must be a UUID, or omit / use ALL for all homes.');
+        }
+        const hk = await pool.query(`SELECT id FROM homes WHERE id = $1::uuid`, [homeIdRaw]);
+        if (hk.rows.length === 0) return clientError(req, res, 404, 'Home not found.');
+        filterHomeId = homeIdRaw;
+      }
+    }
+
+    const { rows } = await pool.query(
+      `SELECT su.id, su.first_name, su.last_name, su.date_of_birth, su.nhs_number, su.status, su.legal_hold,
+              su.profile_image_url,
+              h.id AS home_id, h.name AS home_name, u.name AS unit_name, b.room_number
+       FROM service_users su
+       LEFT JOIN beds b ON su.current_bed_id = b.id
+       LEFT JOIN units u ON b.unit_id = u.id
+       LEFT JOIN homes h ON su.home_id = h.id
+       WHERE su.status IN ('ADMITTED', 'DISCHARGED', 'PENDING', 'ARCHIVED')
+         AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+       ORDER BY h.name NULLS LAST, su.last_name ASC NULLS LAST, su.first_name ASC NULLS LAST`,
+      [filterHomeId]
+    );
+
+    const lines = ['\ufeff'];
+    lines.push(
+      csvLine([
+        'service_user_id',
+        'first_name',
+        'last_name',
+        'date_of_birth',
+        'nhs_number',
+        'status',
+        'legal_hold',
+        'home_id',
+        'home_name',
+        'unit_name',
+        'room_number',
+        'has_profile_photo',
+      ])
+    );
+    for (const r of rows) {
+      const hasPhoto = Boolean(r.profile_image_url && String(r.profile_image_url).trim());
+      lines.push(
+        csvLine([
+          r.id,
+          r.first_name,
+          r.last_name,
+          r.date_of_birth ? new Date(r.date_of_birth).toISOString().slice(0, 10) : '',
+          r.nhs_number,
+          r.status,
+          r.legal_hold ? 'true' : 'false',
+          r.home_id,
+          r.home_name,
+          r.unit_name,
+          r.room_number,
+          hasPhoto ? 'true' : 'false',
+        ])
+      );
+    }
+    const body = lines.join('');
+    const slug = filterHomeId ? String(filterHomeId) : 'all-homes';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="residents-roster-${slug}.csv"`);
+    await writeAuditLog(req, {
+      action: 'ANALYTICS_RESIDENT_ROSTER_EXPORT_CSV',
+      resourceType: 'analytics',
+      resourceId: filterHomeId,
+      metadata: {
+        rowCount: rows.length,
+        homeScopeAll: filterHomeId == null,
+      },
+    });
+    return res.status(200).send(body);
+  } catch (err) {
+    logRequestError(req, err, 'analytics-residents-export');
+    clientError(req, res, 500, 'Unable to generate roster export.');
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 1. GET ALL RESIDENTS (SCOPED)
 // ---------------------------------------------------------------------------
 app.get(
