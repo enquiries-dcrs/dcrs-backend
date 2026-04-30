@@ -244,6 +244,27 @@ function userHomeScope(req) {
   return req.dbUser?.home_scope_id ?? null;
 }
 
+function normalizeTaskPriorityForDb(raw) {
+  if (raw == null || raw === '') return 'Normal';
+  const s = String(raw).trim().toUpperCase().replace(/\s+/g, '_');
+  if (s === 'LOW') return 'Low';
+  if (s === 'HIGH') return 'High';
+  if (s === 'CRITICAL') return 'Critical';
+  if (s === 'NORMAL') return 'Normal';
+  // legacy / title case
+  const t = String(raw).trim();
+  if (/^high$/i.test(t)) return 'High';
+  if (/^low$/i.test(t)) return 'Low';
+  if (/^critical$/i.test(t)) return 'Critical';
+  if (/^normal$/i.test(t)) return 'Normal';
+  return 'Normal';
+}
+
+function taskPriorityIsHigh(p) {
+  const s = String(p || '').trim().toLowerCase();
+  return s === 'high' || s === 'critical';
+}
+
 function normalizeTaskRow(t) {
   if (!t || typeof t !== 'object') return t;
   const due =
@@ -252,13 +273,32 @@ function normalizeTaskRow(t) {
     t.due_at ??
     t.dueAt ??
     null;
-  const dueDate = due ? new Date(due).toLocaleDateString('en-GB') : (t.dueDate || t.due_date || null);
+  let dueDateIso = null;
+  if (due) {
+    const d = new Date(due);
+    if (!Number.isNaN(d.getTime())) dueDateIso = d.toISOString().slice(0, 10);
+  }
+  const dueDate = dueDateIso
+    ? new Date(`${dueDateIso}T12:00:00Z`).toLocaleDateString('en-GB')
+    : t.dueDate || t.due_date || null;
+  const pr = t.priority ?? t.task_priority ?? 'Normal';
+  const af = t.assigned_first_name ?? t.assignee_first_name ?? null;
+  const al = t.assigned_last_name ?? t.assignee_last_name ?? null;
+  const assignedToName =
+    t.assigned_to && (af || al)
+      ? `${String(af || '').trim()} ${String(al || '').trim()}`.trim() || null
+      : t.assigned_to
+        ? 'Staff'
+        : null;
   return {
     id: t.id,
     title: t.title ?? t.task_title ?? t.name ?? '',
     status: t.status ?? t.task_status ?? 'Open',
-    priority: t.priority ?? t.task_priority ?? 'Normal',
+    priority: pr,
     dueDate,
+    dueDateIso,
+    assignedToId: t.assigned_to ?? null,
+    assignedToName,
     // keep originals for debugging/compat without leaking unexpected columns
     created_at: t.created_at ?? null,
   };
@@ -378,6 +418,8 @@ const ROLES_OFFLINE_SYNC_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 // NHS mock: same role set as routine clinical reads (no drift between lists).
 const ROLES_NHS_INTEGRATION_READ = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_TASKS_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
+/** Assign / clear task assignee (Senior Carer+). */
+const ROLES_TASK_ASSIGN = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
@@ -1050,7 +1092,9 @@ app.get(
       INNER JOIN service_users su ON su.id = t.service_user_id
       WHERE t.service_user_id = $1::uuid
         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
-      ORDER BY t.due_date ASC`;
+      ORDER BY
+        CASE WHEN lower(trim(coalesce(t.status, ''))) IN ('completed', 'done') THEN 1 ELSE 0 END,
+        t.due_date ASC NULLS LAST`;
     const notesQuery = `
       SELECT dn.* FROM daily_notes dn
       INNER JOIN service_users su ON su.id = dn.service_user_id
@@ -1076,7 +1120,29 @@ app.get(
       pool.query(obsQuery, [id, scope]),
     ]);
 
-    resident.tasks = (tasksRes.rows || []).map(normalizeTaskRow);
+    const taskRows = tasksRes.rows || [];
+    const assignIds = [...new Set(taskRows.map((r) => r.assigned_to).filter(Boolean))];
+    let assignNameById = {};
+    if (assignIds.length) {
+      try {
+        const an = await pool.query(
+          `SELECT id, first_name, last_name FROM users WHERE id = ANY($1::uuid[])`,
+          [assignIds]
+        );
+        assignNameById = Object.fromEntries(
+          an.rows.map((u) => [String(u.id), { first_name: u.first_name, last_name: u.last_name }])
+        );
+      } catch (e) {
+        logRequestError(req, e, 'resident-task-assignees');
+      }
+    }
+    resident.tasks = taskRows.map((r) => {
+      const aid = r.assigned_to ? String(r.assigned_to) : null;
+      const nm = aid ? assignNameById[aid] : null;
+      return normalizeTaskRow(
+        nm ? { ...r, assigned_first_name: nm.first_name, assigned_last_name: nm.last_name } : r
+      );
+    });
     resident.dailyNotes = notesRes.rows.map((n) => ({
       id: n.id,
       text: n.note_text,
@@ -1625,7 +1691,7 @@ app.post(
         `INSERT INTO tasks (service_user_id, title, status, priority, due_date)
          VALUES ($1::uuid, $2, $3, $4, $5)
          RETURNING *`,
-        [residentId, title, 'Open', priority || 'Normal', dueDate]
+        [residentId, title, 'Open', normalizeTaskPriorityForDb(priority), dueDate]
       );
       const taskRow = taskIns.rows[0];
 
@@ -2373,6 +2439,21 @@ app.post(
     const title = typeof body.title === 'string' ? body.title.trim() : '';
     const priority = typeof body.priority === 'string' ? body.priority.trim() : 'Normal';
     const dueDateRaw = body.dueDate ?? body.due_date ?? null;
+    const hasAssignOnCreate =
+      Object.prototype.hasOwnProperty.call(body, 'assigned_to') ||
+      Object.prototype.hasOwnProperty.call(body, 'assignedTo');
+    let assignedTo = null;
+    if (hasAssignOnCreate) {
+      if (!ROLES_TASK_ASSIGN.includes(req.dbUser?.system_role)) {
+        return clientError(req, res, 403, 'You do not have permission to assign tasks.');
+      }
+      const rawAssign = body.assigned_to ?? body.assignedTo;
+      if (rawAssign !== null && rawAssign !== undefined && String(rawAssign).trim() !== '') {
+        const sid = String(rawAssign).trim();
+        if (!/^[0-9a-f-]{36}$/i.test(sid)) return clientError(req, res, 400, 'assigned_to must be a UUID.');
+        assignedTo = sid;
+      }
+    }
 
     if (!title) return clientError(req, res, 400, 'Task title is required.');
     if (title.length > 200) return clientError(req, res, 400, 'Task title is too long.');
@@ -2388,28 +2469,65 @@ app.post(
     try {
       // Ensure resident exists and is in scope
       const scopeCheck = await pool.query(
-        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        `SELECT id, home_id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
         [id, scope]
       );
       if (scopeCheck.rows.length === 0) {
         return clientError(req, res, 403, 'Access denied to this resident');
       }
+      const residentHomeId = scopeCheck.rows[0].home_id ?? null;
+
+      if (assignedTo) {
+        const ures = await pool.query(`SELECT id, home_scope_id FROM users WHERE id = $1::uuid`, [assignedTo]);
+        if (ures.rows.length === 0) return clientError(req, res, 400, 'Assignee not found.');
+        const ah = ures.rows[0].home_scope_id;
+        if (ah != null && residentHomeId != null && String(ah) !== String(residentHomeId)) {
+          return clientError(req, res, 403, 'Assignee is not in the same home as this service user.');
+        }
+      }
 
       // Insert into tasks table. Column names may vary across environments; try common DCRS schema.
       // Expected columns: id uuid, service_user_id uuid, title text, status text, priority text, due_date timestamptz/date, created_at timestamptz
-      const ins = await pool.query(
-        `INSERT INTO tasks (service_user_id, title, status, priority, due_date)
-         VALUES ($1::uuid, $2, $3, $4, $5)
-         RETURNING *`,
-        [id, title, 'Open', priority || 'Normal', dueDate]
-      );
+      let ins;
+      try {
+        ins = await pool.query(
+          `INSERT INTO tasks (service_user_id, title, status, priority, due_date, assigned_to)
+           VALUES ($1::uuid, $2, $3, $4, $5, $6)
+           RETURNING *`,
+          [id, title, 'Open', normalizeTaskPriorityForDb(priority), dueDate, assignedTo]
+        );
+      } catch (eIns) {
+        const code = eIns && typeof eIns === 'object' ? eIns.code : null;
+        const msg = eIns && typeof eIns === 'object' ? String(eIns.message || '') : '';
+        const missingAssignCol = code === '42703' || /assigned_to/i.test(msg);
+        if (missingAssignCol && assignedTo) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Task assignee column is not available yet (database migration not applied). Run backend/sql/018_tasks_assigned_priority_index.sql in Supabase and retry.'
+          );
+        }
+        if (!missingAssignCol) throw eIns;
+        ins = await pool.query(
+          `INSERT INTO tasks (service_user_id, title, status, priority, due_date)
+           VALUES ($1::uuid, $2, $3, $4, $5)
+           RETURNING *`,
+          [id, title, 'Open', normalizeTaskPriorityForDb(priority), dueDate]
+        );
+      }
 
       const row = ins.rows[0];
       await writeAuditLog(req, {
         action: 'TASK_CREATE',
         resourceType: 'task',
         resourceId: row?.id ?? null,
-        metadata: { serviceUserId: id, hasDueDate: Boolean(dueDate) },
+        metadata: {
+          serviceUserId: id,
+          hasDueDate: Boolean(dueDate),
+          priority: normalizeTaskPriorityForDb(priority),
+          hasAssignee: Boolean(assignedTo),
+        },
       });
 
       res.status(201).json({ success: true, task: normalizeTaskRow(row) });
@@ -2428,41 +2546,222 @@ app.patch(
     const scope = userHomeScope(req);
     const body = req.body || {};
 
-    const status = typeof body.status === 'string' ? body.status.trim() : '';
-    if (!status) return clientError(req, res, 400, 'status is required.');
+    const hasStatus = body.status !== undefined && String(body.status).trim() !== '';
+    const hasPriority = body.priority !== undefined;
+    const hasDue = body.dueDate !== undefined || body.due_date !== undefined;
+    const hasAssign =
+      Object.prototype.hasOwnProperty.call(body, 'assigned_to') ||
+      Object.prototype.hasOwnProperty.call(body, 'assignedTo');
+
+    if (!hasStatus && !hasPriority && !hasDue && !hasAssign) {
+      return clientError(req, res, 400, 'Provide at least one of: status, priority, dueDate, assigned_to.');
+    }
+
+    if (hasAssign && !ROLES_TASK_ASSIGN.includes(req.dbUser?.system_role)) {
+      return clientError(req, res, 403, 'You do not have permission to assign tasks.');
+    }
+
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    if (hasStatus) {
+      sets.push(`status = $${i++}`);
+      vals.push(String(body.status).trim());
+    }
+    if (hasPriority) {
+      sets.push(`priority = $${i++}`);
+      vals.push(normalizeTaskPriorityForDb(body.priority));
+    }
+    if (hasDue) {
+      const rawDue = body.dueDate ?? body.due_date;
+      if (rawDue === null || rawDue === '') {
+        sets.push(`due_date = $${i++}`);
+        vals.push(null);
+      } else {
+        const d = new Date(String(rawDue));
+        if (Number.isNaN(d.getTime())) return clientError(req, res, 400, 'dueDate must be a valid date or empty.');
+        sets.push(`due_date = $${i++}`);
+        vals.push(d.toISOString().slice(0, 10));
+      }
+    }
+    if (hasAssign) {
+      const rawAssign = body.assigned_to ?? body.assignedTo;
+      let assignUuid = null;
+      if (rawAssign !== null && rawAssign !== undefined && String(rawAssign).trim() !== '') {
+        const sid = String(rawAssign).trim();
+        if (!/^[0-9a-f-]{36}$/i.test(sid)) return clientError(req, res, 400, 'assigned_to must be a UUID or null.');
+        assignUuid = sid;
+      }
+      if (assignUuid) {
+        const homeRes = await pool.query(
+          `SELECT home_id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+          [id, scope]
+        );
+        if (homeRes.rows.length === 0) return clientError(req, res, 403, 'Access denied to this resident');
+        const residentHomeId = homeRes.rows[0].home_id ?? null;
+        const ures = await pool.query(`SELECT id, home_scope_id FROM users WHERE id = $1::uuid`, [assignUuid]);
+        if (ures.rows.length === 0) return clientError(req, res, 400, 'Assignee not found.');
+        const ah = ures.rows[0].home_scope_id;
+        if (ah != null && residentHomeId != null && String(ah) !== String(residentHomeId)) {
+          return clientError(req, res, 403, 'Assignee is not in the same home as this service user.');
+        }
+      }
+      sets.push(`assigned_to = $${i++}`);
+      vals.push(assignUuid);
+    }
+
+    vals.push(taskId, id, scope);
 
     try {
       // Update is scoped through service_users.home_id via join (defence in depth)
       const up = await pool.query(
         `UPDATE tasks t
-         SET status = $1
+         SET ${sets.join(', ')}
          FROM service_users su
-         WHERE t.id = $2::uuid
-           AND t.service_user_id = $3::uuid
+         WHERE t.id = $${i}::uuid
+           AND t.service_user_id = $${i + 1}::uuid
            AND su.id = t.service_user_id
-           AND (CAST($4 AS uuid) IS NULL OR su.home_id = CAST($4 AS uuid))
+           AND (CAST($${i + 2} AS uuid) IS NULL OR su.home_id = CAST($${i + 2} AS uuid))
          RETURNING t.*`,
-        [status, taskId, id, scope]
+        vals
       );
 
       if (up.rows.length === 0) {
         return clientError(req, res, 403, 'Access denied or task not found.');
       }
 
+      let rowOut = up.rows[0];
+      if (rowOut?.assigned_to) {
+        try {
+          const an = await pool.query(
+            `SELECT first_name, last_name FROM users WHERE id = $1::uuid`,
+            [rowOut.assigned_to]
+          );
+          if (an.rows[0]) {
+            rowOut = {
+              ...rowOut,
+              assigned_first_name: an.rows[0].first_name,
+              assigned_last_name: an.rows[0].last_name,
+            };
+          }
+        } catch (e) {
+          logRequestError(req, e, 'task-update-assignee-name');
+        }
+      }
+
       await writeAuditLog(req, {
         action: 'TASK_UPDATE',
         resourceType: 'task',
         resourceId: taskId,
-        metadata: { serviceUserId: id, status },
+        metadata: {
+          serviceUserId: id,
+          fields: {
+            status: hasStatus,
+            priority: hasPriority,
+            dueDate: hasDue,
+            assigned_to: hasAssign,
+          },
+        },
       });
 
-      res.json({ success: true, task: normalizeTaskRow(up.rows[0]) });
+      res.json({ success: true, task: normalizeTaskRow(rowOut) });
     } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42703' || /assigned_to/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Task assignee column is not available yet (database migration not applied). Run backend/sql/018_tasks_assigned_priority_index.sql in Supabase and retry.'
+          );
+        }
+      }
       logRequestError(req, err, 'task-update');
       clientError(req, res, 500, 'Could not update task. Please try again later.');
     }
   }
 );
+
+app.get('/api/v1/tasks', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const scope = userHomeScope(req);
+  const overdue = req.query.overdue === 'true';
+  const dueToday = req.query.dueToday === 'true' || req.query.due_today === 'true';
+  const highPriority = req.query.highPriority === 'true' || req.query.high_priority === 'true';
+
+  try {
+    const filters = [];
+    if (overdue) {
+      filters.push(`t.due_date IS NOT NULL
+        AND t.due_date::date < (timezone('UTC', now()))::date
+        AND lower(trim(coalesce(t.status,''))) NOT IN ('completed','done')`);
+    }
+    if (dueToday) {
+      filters.push(`t.due_date IS NOT NULL AND t.due_date::date = (timezone('UTC', now()))::date`);
+    }
+    if (highPriority) {
+      filters.push(`lower(trim(coalesce(t.priority,''))) IN ('high','critical')`);
+    }
+
+    const whereExtra = filters.length ? `AND (${filters.join(' AND ')})` : '';
+
+    const q = `
+      SELECT t.*,
+             su.first_name AS resident_first_name,
+             su.last_name AS resident_last_name
+      FROM tasks t
+      INNER JOIN service_users su ON su.id = t.service_user_id
+      WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+      ${whereExtra}
+      ORDER BY
+        CASE WHEN lower(trim(coalesce(t.status, ''))) IN ('completed', 'done') THEN 1 ELSE 0 END,
+        t.due_date ASC NULLS LAST,
+        su.last_name ASC,
+        su.first_name ASC
+      LIMIT 300
+    `;
+    const { rows } = await pool.query(q, [scope]);
+    const inboxAssignIds = [...new Set(rows.map((r) => r.assigned_to).filter(Boolean))];
+    let inboxAssignNameById = {};
+    if (inboxAssignIds.length) {
+      try {
+        const an = await pool.query(
+          `SELECT id, first_name, last_name FROM users WHERE id = ANY($1::uuid[])`,
+          [inboxAssignIds]
+        );
+        inboxAssignNameById = Object.fromEntries(
+          an.rows.map((u) => [String(u.id), { first_name: u.first_name, last_name: u.last_name }])
+        );
+      } catch (e) {
+        logRequestError(req, e, 'tasks-inbox-assignees');
+      }
+    }
+    await writeAuditLog(req, {
+      action: 'TASK_INBOX_VIEW',
+      resourceType: 'task',
+      resourceId: null,
+      metadata: { resultCount: rows.length, overdue, dueToday, highPriority },
+    });
+    res.json({
+      tasks: rows.map((r) => {
+        const aid = r.assigned_to ? String(r.assigned_to) : null;
+        const nm = aid ? inboxAssignNameById[aid] : null;
+        const enriched = nm
+          ? { ...r, assigned_first_name: nm.first_name, assigned_last_name: nm.last_name }
+          : r;
+        return {
+          ...normalizeTaskRow(enriched),
+          serviceUserId: r.service_user_id,
+          residentName: `${String(r.resident_first_name || '').trim()} ${String(r.resident_last_name || '').trim()}`.trim(),
+        };
+      }),
+    });
+  } catch (err) {
+    logRequestError(req, err, 'tasks-inbox');
+    clientError(req, res, 500, 'Unable to load tasks.');
+  }
+});
 
 // ---------------------------------------------------------------------------
 // FOOD & DRINK CHART (DAILY, SCOPED)
