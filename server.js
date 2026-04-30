@@ -382,6 +382,8 @@ const ROLES_FOOD_DRINK_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_ACTIVITIES_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_PEEP_WRITE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_CARE_PLAN_EDIT = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_CARE_PLAN_ARCHIVE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 
 app.use('/api/v1', authenticateToken);
 
@@ -1084,6 +1086,396 @@ app.get(
     logRequestError(req, err, 'resident-detail');
     clientError(req, res, 500, 'Unable to load resident record. Please try again later.');
   }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// CARE PLANS (V1 MINIMAL) — SCOPED TO RESIDENT + HOME
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/v1/residents/:id/care-plans',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) return clientError(req, res, 403, 'Access denied to this resident');
+
+      const plansRes = await pool.query(
+        `SELECT cp.id, cp.service_user_id, cp.title, cp.status, cp.created_by, cp.created_at, cp.updated_at
+         FROM public.care_plans cp
+         INNER JOIN public.service_users su ON su.id = cp.service_user_id
+         WHERE cp.service_user_id = $1::uuid
+           AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+         ORDER BY (cp.status = 'ACTIVE') DESC, cp.updated_at DESC`,
+        [id, scope]
+      );
+
+      const planIds = plansRes.rows.map((p) => p.id);
+      let goalsByPlan = {};
+      if (planIds.length > 0) {
+        const goalsRes = await pool.query(
+          `SELECT g.id, g.care_plan_id, g.goal_text, g.target_date, g.status, g.created_by, g.created_at, g.updated_at
+           FROM public.care_plan_goals g
+           WHERE g.care_plan_id = ANY($1::uuid[])
+           ORDER BY (g.status IN ('OPEN','IN_PROGRESS')) DESC, g.updated_at DESC`,
+          [planIds]
+        );
+        goalsByPlan = goalsRes.rows.reduce((acc, row) => {
+          (acc[row.care_plan_id] ||= []).push(row);
+          return acc;
+        }, {});
+      }
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_LIST_VIEW',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { planCount: plansRes.rows.length },
+      });
+
+      res.json({
+        plans: plansRes.rows.map((p) => ({
+          ...p,
+          goals: goalsByPlan[p.id] || [],
+        })),
+      });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /care_plans|care_plan_goals/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Care plans are not available yet (database migration not applied). Run the care plans SQL migration in Supabase and retry.'
+          );
+        }
+      }
+      logRequestError(req, err, 'care-plan-list');
+      clientError(req, res, 500, 'Unable to load care plans.');
+    }
+  }
+);
+
+app.post(
+  '/api/v1/residents/:id/care-plans',
+  requireRole(ROLES_CARE_PLAN_EDIT),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+    const title = typeof body.title === 'string' ? body.title.trim() : '';
+    const statusRaw = typeof body.status === 'string' ? body.status.trim().toUpperCase() : 'ACTIVE';
+    const status = statusRaw === 'DRAFT' || statusRaw === 'ACTIVE' ? statusRaw : 'ACTIVE';
+    if (!title) return clientError(req, res, 400, 'title is required.');
+    if (title.length > 200) return clientError(req, res, 400, 'title is too long.');
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const scopeCheck = await client.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const ins = await client.query(
+        `INSERT INTO public.care_plans (service_user_id, title, status, created_by, created_at, updated_at)
+         VALUES ($1::uuid, $2, $3, $4::uuid, now(), now())
+         RETURNING id, service_user_id, title, status, created_by, created_at, updated_at`,
+        [id, title, status, req.dbUser?.id ?? null]
+      );
+      const newPlanId = ins.rows[0]?.id;
+
+      let archivedCount = 0;
+      if (status === 'ACTIVE' && newPlanId) {
+        const arch = await client.query(
+          `UPDATE public.care_plans
+           SET status = 'ARCHIVED', updated_at = now()
+           WHERE service_user_id = $1::uuid
+             AND id <> $2::uuid
+             AND status = 'ACTIVE'`,
+          [id, newPlanId]
+        );
+        archivedCount = arch.rowCount || 0;
+      }
+
+      await client.query('COMMIT');
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_CREATE',
+        resourceType: 'care_plan',
+        resourceId: newPlanId ?? null,
+        metadata: { serviceUserId: id, status, archivedOtherActivePlans: archivedCount },
+      });
+
+      res.status(201).json({ plan: { ...ins.rows[0], goals: [] } });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        logRequestError(req, rollbackErr, 'care-plan-create-rollback');
+      }
+      // Unique index: only one ACTIVE plan per resident
+      if (err && typeof err === 'object' && err.code === '23505') {
+        return clientError(req, res, 409, 'This resident already has an active care plan. Archive it first or set another plan active.');
+      }
+      logRequestError(req, err, 'care-plan-create');
+      clientError(req, res, 500, 'Could not create care plan.');
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.patch(
+  '/api/v1/care-plans/:planId',
+  requireRole(ROLES_CARE_PLAN_EDIT),
+  async (req, res) => {
+    const { planId } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const title = typeof body.title === 'string' ? body.title.trim() : null;
+    const statusRaw = typeof body.status === 'string' ? body.status.trim().toUpperCase() : null;
+    const status =
+      statusRaw && ['DRAFT', 'ACTIVE', 'ARCHIVED'].includes(statusRaw) ? statusRaw : null;
+
+    if (title === null && status === null) return clientError(req, res, 400, 'No changes provided.');
+    if (title !== null && title.length === 0) return clientError(req, res, 400, 'title cannot be empty.');
+    if (title !== null && title.length > 200) return clientError(req, res, 400, 'title is too long.');
+    if (status === 'ARCHIVED') {
+      // Promotion: only managers can archive
+      const userRole = req.dbUser?.system_role;
+      if (!userRole || !ROLES_CARE_PLAN_ARCHIVE.includes(userRole)) {
+        return clientError(req, res, 403, 'Only management roles can archive care plans.');
+      }
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const up = await client.query(
+        `UPDATE public.care_plans cp
+         SET
+           title = COALESCE($1, cp.title),
+           status = COALESCE($2, cp.status),
+           updated_at = now()
+         FROM public.service_users su
+         WHERE cp.id = $3::uuid
+           AND su.id = cp.service_user_id
+           AND (CAST($4 AS uuid) IS NULL OR su.home_id = CAST($4 AS uuid))
+         RETURNING cp.id, cp.service_user_id, cp.title, cp.status, cp.created_by, cp.created_at, cp.updated_at`,
+        [title, status, planId, scope]
+      );
+      if (up.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return clientError(req, res, 403, 'Access denied or care plan not found.');
+      }
+
+      let archivedCount = 0;
+      if (status === 'ACTIVE') {
+        const residentId = up.rows[0].service_user_id;
+        const arch = await client.query(
+          `UPDATE public.care_plans
+           SET status = 'ARCHIVED', updated_at = now()
+           WHERE service_user_id = $1::uuid
+             AND id <> $2::uuid
+             AND status = 'ACTIVE'`,
+          [residentId, planId]
+        );
+        archivedCount = arch.rowCount || 0;
+      }
+
+      await client.query('COMMIT');
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_UPDATE',
+        resourceType: 'care_plan',
+        resourceId: planId,
+        metadata: {
+          changedTitle: title != null,
+          changedStatus: status != null,
+          status: status ?? undefined,
+          archivedOtherActivePlans: archivedCount,
+        },
+      });
+
+      res.json({ plan: up.rows[0] });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        logRequestError(req, rollbackErr, 'care-plan-update-rollback');
+      }
+      if (err && typeof err === 'object' && err.code === '23505') {
+        return clientError(req, res, 409, 'This resident already has an active care plan. Archive it first or set another plan active.');
+      }
+      logRequestError(req, err, 'care-plan-update');
+      clientError(req, res, 500, 'Could not update care plan.');
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.post(
+  '/api/v1/care-plans/:planId/goals',
+  requireRole(ROLES_CARE_PLAN_EDIT),
+  async (req, res) => {
+    const { planId } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+    const goalText = typeof body.goalText === 'string' ? body.goalText.trim() : '';
+    const statusRaw = typeof body.status === 'string' ? body.status.trim().toUpperCase() : 'OPEN';
+    const status = ['OPEN', 'IN_PROGRESS', 'DONE', 'CANCELLED'].includes(statusRaw) ? statusRaw : 'OPEN';
+    let targetDate = null;
+    if (body.targetDate) {
+      const s = String(body.targetDate).trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'targetDate must be YYYY-MM-DD.');
+      targetDate = s;
+    }
+    if (!goalText) return clientError(req, res, 400, 'goalText is required.');
+    if (goalText.length > 2000) return clientError(req, res, 400, 'goalText is too long.');
+
+    try {
+      const ins = await pool.query(
+        `INSERT INTO public.care_plan_goals (care_plan_id, goal_text, target_date, status, created_by, created_at, updated_at)
+         SELECT cp.id, $1, $2::date, $3, $4::uuid, now(), now()
+         FROM public.care_plans cp
+         INNER JOIN public.service_users su ON su.id = cp.service_user_id
+         WHERE cp.id = $5::uuid
+           AND (CAST($6 AS uuid) IS NULL OR su.home_id = CAST($6 AS uuid))
+         RETURNING id, care_plan_id, goal_text, target_date, status, created_by, created_at, updated_at`,
+        [goalText, targetDate, status, req.dbUser?.id ?? null, planId, scope]
+      );
+      if (ins.rows.length === 0) return clientError(req, res, 403, 'Access denied or care plan not found.');
+
+      await pool.query(`UPDATE public.care_plans SET updated_at = now() WHERE id = $1::uuid`, [planId]);
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_GOAL_CREATE',
+        resourceType: 'care_plan_goal',
+        resourceId: ins.rows[0]?.id ?? null,
+        metadata: { carePlanId: planId, hasTargetDate: Boolean(targetDate), status },
+      });
+
+      res.status(201).json({ goal: ins.rows[0] });
+    } catch (err) {
+      logRequestError(req, err, 'care-goal-create');
+      clientError(req, res, 500, 'Could not create goal.');
+    }
+  }
+);
+
+app.patch(
+  '/api/v1/care-plans/:planId/goals/:goalId',
+  requireRole(ROLES_CARE_PLAN_EDIT),
+  async (req, res) => {
+    const { planId, goalId } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+    const goalText = typeof body.goalText === 'string' ? body.goalText.trim() : null;
+    const statusRaw = typeof body.status === 'string' ? body.status.trim().toUpperCase() : null;
+    const status = statusRaw && ['OPEN', 'IN_PROGRESS', 'DONE', 'CANCELLED'].includes(statusRaw) ? statusRaw : null;
+    let targetDate = null;
+    if (Object.prototype.hasOwnProperty.call(body, 'targetDate')) {
+      if (body.targetDate == null || String(body.targetDate).trim() === '') {
+        targetDate = '';
+      } else {
+        const s = String(body.targetDate).trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'targetDate must be YYYY-MM-DD.');
+        targetDate = s;
+      }
+    }
+
+    if (goalText === null && status === null && targetDate === null) {
+      return clientError(req, res, 400, 'No changes provided.');
+    }
+    if (goalText !== null && goalText.length === 0) return clientError(req, res, 400, 'goalText cannot be empty.');
+    if (goalText !== null && goalText.length > 2000) return clientError(req, res, 400, 'goalText is too long.');
+
+    try {
+      const up = await pool.query(
+        `UPDATE public.care_plan_goals g
+         SET
+           goal_text = COALESCE($1, g.goal_text),
+           status = COALESCE($2, g.status),
+           target_date = CASE WHEN $3::text IS NULL THEN g.target_date WHEN $3::text = '' THEN NULL ELSE $3::date END,
+           updated_at = now()
+         FROM public.care_plans cp
+         INNER JOIN public.service_users su ON su.id = cp.service_user_id
+         WHERE g.id = $4::uuid
+           AND g.care_plan_id = cp.id
+           AND cp.id = $5::uuid
+           AND (CAST($6 AS uuid) IS NULL OR su.home_id = CAST($6 AS uuid))
+         RETURNING g.id, g.care_plan_id, g.goal_text, g.target_date, g.status, g.created_by, g.created_at, g.updated_at`,
+        [goalText, status, targetDate, goalId, planId, scope]
+      );
+      if (up.rows.length === 0) return clientError(req, res, 403, 'Access denied or goal not found.');
+
+      await pool.query(`UPDATE public.care_plans SET updated_at = now() WHERE id = $1::uuid`, [planId]);
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_GOAL_UPDATE',
+        resourceType: 'care_plan_goal',
+        resourceId: goalId,
+        metadata: { carePlanId: planId, changedText: goalText != null, changedStatus: status != null, changedTarget: targetDate != null },
+      });
+
+      res.json({ goal: up.rows[0] });
+    } catch (err) {
+      logRequestError(req, err, 'care-goal-update');
+      clientError(req, res, 500, 'Could not update goal.');
+    }
+  }
+);
+
+app.delete(
+  '/api/v1/care-plans/:planId/goals/:goalId',
+  requireRole(ROLES_CARE_PLAN_EDIT),
+  async (req, res) => {
+    const { planId, goalId } = req.params;
+    const scope = userHomeScope(req);
+    try {
+      const del = await pool.query(
+        `DELETE FROM public.care_plan_goals g
+         USING public.care_plans cp, public.service_users su
+         WHERE g.id = $1::uuid
+           AND g.care_plan_id = cp.id
+           AND cp.id = $2::uuid
+           AND su.id = cp.service_user_id
+           AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))
+         RETURNING g.id`,
+        [goalId, planId, scope]
+      );
+      if (del.rows.length === 0) return clientError(req, res, 403, 'Access denied or goal not found.');
+
+      await pool.query(`UPDATE public.care_plans SET updated_at = now() WHERE id = $1::uuid`, [planId]);
+
+      await writeAuditLog(req, {
+        action: 'CARE_PLAN_GOAL_DELETE',
+        resourceType: 'care_plan_goal',
+        resourceId: goalId,
+        metadata: { carePlanId: planId },
+      });
+
+      res.json({ success: true });
+    } catch (err) {
+      logRequestError(req, err, 'care-goal-delete');
+      clientError(req, res, 500, 'Could not delete goal.');
+    }
   }
 );
 
