@@ -386,6 +386,33 @@ const ROLES_CARE_PLAN_EDIT = ['Senior Carer', 'Deputy Manager', 'Home Manager', 
 const ROLES_CARE_PLAN_ARCHIVE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_ASSESSMENT_TEMPLATES_EDIT = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_ASSESSMENTS_CREATE = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_RESIDENT_DOCUMENTS_UPLOAD = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_RESIDENT_DOCUMENTS_DELETE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+
+const residentDocUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
+  fileFilter(_req, file, cb) {
+    // Allow common clinical document formats
+    const allowed = new Set([
+      'application/pdf',
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'text/plain',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      'application/msword',
+    ]);
+    if (allowed.has(file.mimetype)) return cb(null, true);
+    cb(new Error('Unsupported file type. Allowed: PDF, images, TXT, DOC, DOCX.'));
+  },
+});
+
+function sanitizeFilename(name) {
+  const raw = typeof name === 'string' ? name.trim() : '';
+  const base = raw.replace(/[/\\?%*:|"<>]/g, '-').replace(/\s+/g, ' ').trim();
+  return base.slice(0, 120) || 'document';
+}
 
 app.use('/api/v1', authenticateToken);
 
@@ -2072,6 +2099,263 @@ app.get('/api/v1/assessments/:assessmentId', requireRole(ROLES_RESIDENT_AND_FACI
   } catch (err) {
     logRequestError(req, err, 'assessment-view');
     clientError(req, res, 500, 'Unable to load assessment.');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// RESIDENT DOCUMENTS (UPLOAD/LIST/DOWNLOAD/DELETE) — SCOPED
+// ---------------------------------------------------------------------------
+
+app.get('/api/v1/residents/:id/documents', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  try {
+    const { rows } = await pool.query(
+      `SELECT d.id, d.service_user_id, d.file_name, d.mime_type, d.size_bytes, d.doc_type, d.uploaded_by, d.uploaded_at
+       FROM public.resident_documents d
+       INNER JOIN public.service_users su ON su.id = d.service_user_id
+       WHERE d.service_user_id = $1::uuid
+         AND d.is_deleted = false
+         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+       ORDER BY d.uploaded_at DESC
+       LIMIT 500`,
+      [id, scope]
+    );
+    await writeAuditLog(req, {
+      action: 'RESIDENT_DOCUMENT_LIST_VIEW',
+      resourceType: 'service_user',
+      resourceId: id,
+      metadata: { resultCount: rows.length },
+    });
+    res.json({ documents: rows });
+  } catch (err) {
+    if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+      const code = err.code;
+      const msg = err.message || '';
+      if (code === '42P01' || /resident_documents/i.test(String(msg))) {
+        return clientError(
+          req,
+          res,
+          503,
+          'Resident documents are not available yet (database migration not applied). Run the resident documents SQL migration in Supabase and retry.'
+        );
+      }
+    }
+    logRequestError(req, err, 'resident-docs-list');
+    clientError(req, res, 500, 'Unable to load resident documents.');
+  }
+});
+
+app.post(
+  '/api/v1/residents/:id/documents',
+  requireRole(ROLES_RESIDENT_DOCUMENTS_UPLOAD),
+  (req, res, next) => {
+    residentDocUpload.single('file')(req, res, (err) => {
+      if (err) {
+        if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+          return clientError(req, res, 400, 'File must be 20MB or smaller.');
+        }
+        return clientError(req, res, 400, err.message || 'Invalid upload.');
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const docType = typeof req.body?.docType === 'string' ? req.body.docType.trim() : null;
+
+    if (!req.file || !req.file.buffer) {
+      return clientError(req, res, 400, 'Missing file (field name: file).');
+    }
+    if (!supabaseAdmin) {
+      return clientError(req, res, 500, 'Server misconfiguration. Contact support.');
+    }
+
+    const bucket =
+      (process.env.SUPABASE_RESIDENT_DOCUMENTS_BUCKET || 'resident-documents').trim() || 'resident-documents';
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Scope check + home id (for storage key)
+      const suRes = await client.query(
+        `SELECT id, home_id FROM public.service_users
+         WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (suRes.rows.length === 0) {
+        await client.query('ROLLBACK');
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+      const homeId = suRes.rows[0].home_id || null;
+
+      // Create metadata row first to get id for object path
+      const originalName = sanitizeFilename(req.file.originalname || 'document');
+      const mime = req.file.mimetype || 'application/octet-stream';
+      const size = req.file.size || req.file.buffer.length || 0;
+
+      const metaIns = await client.query(
+        `INSERT INTO public.resident_documents
+          (service_user_id, home_scope_id, file_path, file_name, mime_type, size_bytes, doc_type, uploaded_by, uploaded_at, is_deleted)
+         VALUES ($1::uuid, $2::uuid, '', $3, $4, $5::bigint, $6, $7::uuid, now(), false)
+         RETURNING id`,
+        [id, homeId, originalName, mime, size, docType, req.dbUser?.id ?? null]
+      );
+      const docId = metaIns.rows[0].id;
+
+      const objectPath = `home/${homeId || 'ALL'}/resident/${id}/${docId}-${originalName}`;
+
+      const { error: upErr } = await supabaseAdmin.storage.from(bucket).upload(objectPath, req.file.buffer, {
+        contentType: mime,
+        upsert: false,
+      });
+      if (upErr) {
+        const msg = upErr.message || String(upErr);
+        if (/not found|does not exist|Bucket/i.test(msg)) {
+          await client.query('ROLLBACK');
+          return clientError(
+            req,
+            res,
+            503,
+            `Storage bucket "${bucket}" is missing or not configured. Create a private bucket with this name in Supabase (Storage), then retry.`
+          );
+        }
+        throw upErr;
+      }
+
+      await client.query(`UPDATE public.resident_documents SET file_path = $1 WHERE id = $2::uuid`, [
+        objectPath,
+        docId,
+      ]);
+
+      await client.query('COMMIT');
+
+      await writeAuditLog(req, {
+        action: 'RESIDENT_DOCUMENT_UPLOAD',
+        resourceType: 'resident_document',
+        resourceId: docId,
+        metadata: { serviceUserId: id, bucket, mimeType: mime, sizeBytes: size, docType: docType || undefined },
+      });
+
+      res.status(201).json({
+        success: true,
+        document: {
+          id: docId,
+          service_user_id: id,
+          file_name: originalName,
+          mime_type: mime,
+          size_bytes: size,
+          doc_type: docType,
+          uploaded_at: new Date().toISOString(),
+        },
+      });
+    } catch (err) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        logRequestError(req, rollbackErr, 'resident-doc-upload-rollback');
+      }
+      logRequestError(req, err, 'resident-doc-upload');
+      clientError(req, res, 500, 'Could not upload document.');
+    } finally {
+      client.release();
+    }
+  }
+);
+
+app.get('/api/v1/documents/:docId/download', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { docId } = req.params;
+  const scope = userHomeScope(req);
+  if (!supabaseAdmin) return clientError(req, res, 500, 'Server misconfiguration. Contact support.');
+  const bucket =
+    (process.env.SUPABASE_RESIDENT_DOCUMENTS_BUCKET || 'resident-documents').trim() || 'resident-documents';
+
+  try {
+    const docRes = await pool.query(
+      `SELECT d.id, d.file_path, d.service_user_id
+       FROM public.resident_documents d
+       INNER JOIN public.service_users su ON su.id = d.service_user_id
+       WHERE d.id = $1::uuid
+         AND d.is_deleted = false
+         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+      [docId, scope]
+    );
+    if (docRes.rows.length === 0) return clientError(req, res, 404, 'Document not found.');
+    const filePath = docRes.rows[0].file_path;
+    if (!filePath) return clientError(req, res, 500, 'Document storage path missing.');
+
+    const { data, error } = await supabaseAdmin.storage.from(bucket).createSignedUrl(filePath, 60 * 10);
+    if (error) throw error;
+
+    await writeAuditLog(req, {
+      action: 'RESIDENT_DOCUMENT_DOWNLOAD',
+      resourceType: 'resident_document',
+      resourceId: docId,
+      metadata: { serviceUserId: docRes.rows[0].service_user_id, bucket },
+    });
+
+    res.json({ url: data?.signedUrl });
+  } catch (err) {
+    logRequestError(req, err, 'resident-doc-download');
+    clientError(req, res, 500, 'Could not generate download link.');
+  }
+});
+
+app.delete('/api/v1/documents/:docId', requireRole(ROLES_RESIDENT_DOCUMENTS_DELETE), async (req, res) => {
+  const { docId } = req.params;
+  const scope = userHomeScope(req);
+  const bucket =
+    (process.env.SUPABASE_RESIDENT_DOCUMENTS_BUCKET || 'resident-documents').trim() || 'resident-documents';
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const docRes = await client.query(
+      `SELECT d.id, d.file_path, d.service_user_id
+       FROM public.resident_documents d
+       INNER JOIN public.service_users su ON su.id = d.service_user_id
+       WHERE d.id = $1::uuid
+         AND d.is_deleted = false
+         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+      [docId, scope]
+    );
+    if (docRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return clientError(req, res, 404, 'Document not found.');
+    }
+
+    await client.query(`UPDATE public.resident_documents SET is_deleted = true WHERE id = $1::uuid`, [docId]);
+    await client.query('COMMIT');
+
+    // Best-effort storage removal (optional)
+    if (supabaseAdmin && docRes.rows[0].file_path) {
+      try {
+        await supabaseAdmin.storage.from(bucket).remove([docRes.rows[0].file_path]);
+      } catch (_) {
+        // ignore storage delete failures (soft delete already applied)
+      }
+    }
+
+    await writeAuditLog(req, {
+      action: 'RESIDENT_DOCUMENT_DELETE',
+      resourceType: 'resident_document',
+      resourceId: docId,
+      metadata: { serviceUserId: docRes.rows[0].service_user_id, bucket },
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      logRequestError(req, rollbackErr, 'resident-doc-delete-rollback');
+    }
+    logRequestError(req, err, 'resident-doc-delete');
+    clientError(req, res, 500, 'Could not delete document.');
+  } finally {
+    client.release();
   }
 });
 
