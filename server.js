@@ -388,6 +388,24 @@ function mapObservationRow(o) {
   };
 }
 
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const s = String(value);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function csvLine(fields) {
+  return `${fields.map(csvEscape).join(',')}\r\n`;
+}
+
+function oneLine(s) {
+  return String(s ?? '')
+    .replace(/\r\n|\n|\r/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'DCRS Secured API is running!' });
 });
@@ -515,6 +533,8 @@ const ROLES_ASSESSMENT_TEMPLATES_EDIT = ['Deputy Manager', 'Home Manager', 'Regi
 const ROLES_ASSESSMENTS_CREATE = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_RESIDENT_DOCUMENTS_UPLOAD = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_RESIDENT_DOCUMENTS_DELETE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+/** Clinical record CSV export (governance / handover evidence). */
+const ROLES_RESIDENT_RECORD_EXPORT = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 
 const residentDocUpload = multer({
   storage: multer.memoryStorage(),
@@ -1140,6 +1160,306 @@ app.post(
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// RESIDENT CSV EXPORT (Chunk F)
+// ---------------------------------------------------------------------------
+app.get('/api/v1/residents/:id/export.csv', requireRole(ROLES_RESIDENT_RECORD_EXPORT), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  const typeRaw = typeof req.query?.type === 'string' ? req.query.type.trim().toLowerCase() : 'timeline';
+  const exportType = typeRaw === 'documents' ? 'documents' : 'timeline';
+
+  try {
+    const scopeCheck = await pool.query(
+      `SELECT id, first_name, last_name FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+      [id, scope]
+    );
+    if (scopeCheck.rows.length === 0) {
+      return clientError(req, res, 403, 'Access denied to this resident');
+    }
+    const rn = `${String(scopeCheck.rows[0].first_name || '').trim()} ${String(scopeCheck.rows[0].last_name || '').trim()}`.trim();
+
+    if (exportType === 'documents') {
+      let rows = [];
+      try {
+        const r = await pool.query(
+          `SELECT d.id, d.file_name, d.mime_type, d.size_bytes, d.doc_type, d.uploaded_at, d.is_deleted
+           FROM public.resident_documents d
+           INNER JOIN service_users su ON su.id = d.service_user_id
+           WHERE d.service_user_id = $1::uuid
+             AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+           ORDER BY d.uploaded_at DESC`,
+          [id, scope]
+        );
+        rows = r.rows || [];
+      } catch (e) {
+        if (e && typeof e === 'object' && ('code' in e || 'message' in e)) {
+          const code = e.code;
+          const msg = e.message || '';
+          if (code === '42P01' || /resident_documents/i.test(String(msg))) {
+            return clientError(
+              req,
+              res,
+              503,
+              'Resident documents export is not available yet (database migration not applied).'
+            );
+          }
+        }
+        throw e;
+      }
+
+      const lines = ['\ufeff'];
+      lines.push(csvLine(['uploaded_at_utc', 'document_id', 'file_name', 'mime_type', 'size_bytes', 'doc_type', 'is_deleted']));
+      for (const d of rows) {
+        lines.push(
+          csvLine([
+            d.uploaded_at ? new Date(d.uploaded_at).toISOString() : '',
+            d.id,
+            d.file_name,
+            d.mime_type,
+            d.size_bytes,
+            d.doc_type,
+            d.is_deleted ? 'true' : 'false',
+          ])
+        );
+      }
+      const body = lines.join('');
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="resident-${id}-documents.csv"`);
+      await writeAuditLog(req, {
+        action: 'RESIDENT_EXPORT_CSV',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { exportType: 'documents', rowCount: rows.length, residentNameChars: rn.length },
+      });
+      return res.status(200).send(body);
+    }
+
+    /** @type {Array<{ at: Date; category: string; ref: string; summary: string; details: string }>} */
+    const events = [];
+
+    const pushEvent = (atRaw, category, ref, summary, details) => {
+      if (!atRaw) return;
+      const at = atRaw instanceof Date ? atRaw : new Date(atRaw);
+      if (Number.isNaN(at.getTime())) return;
+      events.push({
+        at,
+        category,
+        ref: ref != null ? String(ref) : '',
+        summary: oneLine(summary).slice(0, 500),
+        details: oneLine(details).slice(0, 1500),
+      });
+    };
+
+    try {
+      const tq = await pool.query(
+        `SELECT t.id, t.title, t.status, t.priority, t.due_date, t.created_at
+         FROM tasks t
+         INNER JOIN service_users su ON su.id = t.service_user_id
+         WHERE t.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const t of tq.rows || []) {
+        const at = t.created_at || (t.due_date ? `${String(t.due_date).slice(0, 10)}T12:00:00Z` : null);
+        pushEvent(
+          at,
+          'task',
+          t.id,
+          `${t.title || 'Task'} (${t.status || ''})`,
+          `priority=${t.priority || ''}; due_date=${t.due_date || ''}`
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-tasks');
+    }
+
+    try {
+      const nq = await pool.query(
+        `SELECT dn.id, dn.created_at, dn.author_name, dn.note_text
+         FROM daily_notes dn
+         INNER JOIN service_users su ON su.id = dn.service_user_id
+         WHERE dn.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const n of nq.rows || []) {
+        pushEvent(n.created_at, 'daily_note', n.id, `Note by ${n.author_name || 'Staff'}`, oneLine(n.note_text).slice(0, 800));
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-notes');
+    }
+
+    try {
+      const oq = await pool.query(
+        `SELECT o.id, o.recorded_at, o.observation_type, o.value, o.unit, o.notes
+         FROM observations o
+         INNER JOIN service_users su ON su.id = o.service_user_id
+         WHERE o.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const o of oq.rows || []) {
+        pushEvent(
+          o.recorded_at,
+          'observation',
+          o.id,
+          `${o.observation_type || ''}: ${o.value || ''} ${o.unit || ''}`.trim(),
+          oneLine(o.notes || '')
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-obs');
+    }
+
+    try {
+      const aq = await pool.query(
+        `SELECT a.id, a.created_at, a.status, a.score, a.review_date, t.name AS template_name, t.version AS template_version
+         FROM public.assessments a
+         INNER JOIN service_users su ON su.id = a.service_user_id
+         LEFT JOIN public.assessment_templates t ON t.id = a.template_id
+         WHERE a.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const a of aq.rows || []) {
+        pushEvent(
+          a.created_at,
+          'assessment',
+          a.id,
+          `${a.template_name || 'Assessment'} v${a.template_version ?? ''} (${a.status || ''})`.trim(),
+          `score=${a.score ?? ''}; review_date=${a.review_date || ''}`
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-assessments');
+    }
+
+    try {
+      const dq = await pool.query(
+        `SELECT d.id, d.uploaded_at, d.file_name, d.mime_type, d.size_bytes, d.doc_type
+         FROM public.resident_documents d
+         INNER JOIN service_users su ON su.id = d.service_user_id
+         WHERE d.service_user_id = $1::uuid
+           AND d.is_deleted = false
+           AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const d of dq.rows || []) {
+        pushEvent(
+          d.uploaded_at,
+          'document',
+          d.id,
+          `Document: ${d.file_name || ''}`,
+          `mime=${d.mime_type || ''}; size_bytes=${d.size_bytes ?? ''}; doc_type=${d.doc_type || ''}`
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-documents');
+    }
+
+    try {
+      const fq = await pool.query(
+        `SELECT fde.id, fde.created_at, fde.chart_date, fde.entry_type, fde.description, fde.amount_ml, fde.recorded_by
+         FROM food_drink_entries fde
+         INNER JOIN service_users su ON su.id = fde.service_user_id
+         WHERE fde.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const f of fq.rows || []) {
+        pushEvent(
+          f.created_at || f.chart_date,
+          'food_drink',
+          f.id,
+          `${f.entry_type || ''}`,
+          `chart_date=${f.chart_date || ''}; amount_ml=${f.amount_ml ?? ''}; desc=${oneLine(f.description).slice(0, 300)}; by=${f.recorded_by || ''}`
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-food');
+    }
+
+    try {
+      const actq = await pool.query(
+        `SELECT ae.id, ae.created_at, ae.chart_date, ae.activity_type, ae.notes, ae.recorded_by
+         FROM activity_entries ae
+         INNER JOIN service_users su ON su.id = ae.service_user_id
+         WHERE ae.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const a of actq.rows || []) {
+        pushEvent(
+          a.created_at || a.chart_date,
+          'activity',
+          a.id,
+          `${a.activity_type || 'Activity'}`,
+          `chart_date=${a.chart_date || ''}; notes=${oneLine(a.notes).slice(0, 400)}; by=${a.recorded_by || ''}`
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-activities');
+    }
+
+    try {
+      const cq = await pool.query(
+        `SELECT dce.id, dce.created_at, dce.chart_date, dce.care_item, dce.value, dce.notes, dce.recorded_by
+         FROM daily_care_entries dce
+         INNER JOIN service_users su ON su.id = dce.service_user_id
+         WHERE dce.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      for (const c of cq.rows || []) {
+        pushEvent(
+          c.created_at || c.chart_date,
+          'daily_care',
+          c.id,
+          `${c.care_item || 'Care'}: ${c.value || ''}`,
+          `chart_date=${c.chart_date || ''}; notes=${oneLine(c.notes).slice(0, 400)}; by=${c.recorded_by || ''}`
+        );
+      }
+    } catch (e) {
+      logRequestError(req, e, 'export-csv-daily-care');
+    }
+
+    events.sort((a, b) => b.at.getTime() - a.at.getTime());
+
+    const lines = ['\ufeff'];
+    lines.push(
+      csvLine([
+        'occurred_at_utc',
+        'category',
+        'reference_id',
+        'summary',
+        'details',
+        'service_user_id',
+        'resident_name_hint',
+      ])
+    );
+    for (const ev of events) {
+      lines.push(
+        csvLine([
+          ev.at.toISOString(),
+          ev.category,
+          ev.ref,
+          ev.summary,
+          ev.details,
+          id,
+          rn,
+        ])
+      );
+    }
+    const body = lines.join('');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="resident-${id}-timeline.csv"`);
+    await writeAuditLog(req, {
+      action: 'RESIDENT_EXPORT_CSV',
+      resourceType: 'service_user',
+      resourceId: id,
+      metadata: { exportType: 'timeline', rowCount: events.length, residentNameChars: rn.length },
+    });
+    return res.status(200).send(body);
+  } catch (err) {
+    logRequestError(req, err, 'resident-export-csv');
+    clientError(req, res, 500, 'Unable to generate export.');
+  }
+});
 
 // ---------------------------------------------------------------------------
 // 2. GET SINGLE RESIDENT (SCOPED)
