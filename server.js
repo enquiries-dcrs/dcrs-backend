@@ -1823,6 +1823,146 @@ app.get('/api/v1/residents/:id/assessments', requireRole(ROLES_RESIDENT_AND_FACI
   }
 });
 
+function schemaFieldsFromTemplateSchema(schemaJson) {
+  if (!schemaJson || typeof schemaJson !== 'object') return [];
+  const fields = schemaJson.fields;
+  return Array.isArray(fields) ? fields : [];
+}
+
+function allowedSelectValues(field) {
+  const opts = field?.options;
+  if (!Array.isArray(opts)) return null;
+  const values = new Set();
+  for (const o of opts) {
+    if (o && typeof o === 'object') values.add(String(o.value ?? o.label ?? ''));
+    else values.add(String(o));
+  }
+  values.delete('');
+  return values;
+}
+
+function validateAnswersAgainstSchema(schemaJson, answersJson) {
+  const errors = {};
+  const fields = schemaFieldsFromTemplateSchema(schemaJson);
+  for (const f of fields) {
+    const key = typeof f?.key === 'string' ? f.key.trim() : '';
+    if (!key) continue;
+    const label = typeof f?.label === 'string' ? f.label.trim() : key;
+    const type = typeof f?.type === 'string' ? f.type.trim().toLowerCase() : 'text';
+    const required = Boolean(f?.required);
+
+    const value = answersJson ? answersJson[key] : undefined;
+    const isEmpty =
+      value === null ||
+      value === undefined ||
+      (typeof value === 'string' && value.trim() === '') ||
+      (type === 'checkbox' && value === false);
+
+    if (required && isEmpty) {
+      errors[key] = `${label} is required.`;
+      continue;
+    }
+
+    if (isEmpty) continue;
+
+    if (type === 'number') {
+      const n = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(n)) {
+        errors[key] = `${label} must be a number.`;
+        continue;
+      }
+      if (f.min != null && Number.isFinite(Number(f.min)) && n < Number(f.min)) {
+        errors[key] = `${label} must be at least ${Number(f.min)}.`;
+        continue;
+      }
+      if (f.max != null && Number.isFinite(Number(f.max)) && n > Number(f.max)) {
+        errors[key] = `${label} must be at most ${Number(f.max)}.`;
+        continue;
+      }
+      continue;
+    }
+
+    if (type === 'checkbox') {
+      if (typeof value !== 'boolean') {
+        errors[key] = `${label} must be true/false.`;
+      }
+      continue;
+    }
+
+    // text-like
+    const s = typeof value === 'string' ? value : String(value);
+    if (f.minLength != null && Number.isFinite(Number(f.minLength)) && s.length < Number(f.minLength)) {
+      errors[key] = `${label} must be at least ${Number(f.minLength)} characters.`;
+      continue;
+    }
+    if (f.maxLength != null && Number.isFinite(Number(f.maxLength)) && s.length > Number(f.maxLength)) {
+      errors[key] = `${label} must be at most ${Number(f.maxLength)} characters.`;
+      continue;
+    }
+    if (type === 'select') {
+      const allowed = allowedSelectValues(f);
+      if (allowed && !allowed.has(String(s))) {
+        errors[key] = `${label} must be one of the allowed options.`;
+        continue;
+      }
+    }
+    if (typeof f.pattern === 'string' && f.pattern.trim() !== '') {
+      try {
+        const re = new RegExp(f.pattern);
+        if (!re.test(s)) errors[key] = `${label} is not in the expected format.`;
+      } catch (_) {
+        // ignore invalid patterns
+      }
+    }
+  }
+  return errors;
+}
+
+function computeScoreFromScoringJson(scoringJson, answersJson) {
+  if (!scoringJson || typeof scoringJson !== 'object') return { score: null, band: null };
+  const type = typeof scoringJson.type === 'string' ? scoringJson.type.trim().toLowerCase() : '';
+  if (type !== 'sum') return { score: null, band: null };
+
+  const fields = scoringJson.fields && typeof scoringJson.fields === 'object' ? scoringJson.fields : {};
+  let total = 0;
+  for (const [key, rule] of Object.entries(fields)) {
+    if (!rule || typeof rule !== 'object') continue;
+    const map = rule.map && typeof rule.map === 'object' ? rule.map : null;
+    const def = rule.default != null && Number.isFinite(Number(rule.default)) ? Number(rule.default) : 0;
+    const v = answersJson ? answersJson[key] : undefined;
+    if (v === null || v === undefined || v === '') {
+      total += def;
+      continue;
+    }
+    if (map) {
+      const mapped = map[String(v)];
+      if (mapped != null && Number.isFinite(Number(mapped))) total += Number(mapped);
+      else total += def;
+    } else if (typeof v === 'number' && Number.isFinite(v)) {
+      total += v;
+    } else if (Number.isFinite(Number(v))) {
+      total += Number(v);
+    } else {
+      total += def;
+    }
+  }
+
+  let band = null;
+  if (Array.isArray(scoringJson.bands)) {
+    for (const b of scoringJson.bands) {
+      const min = b?.min != null && Number.isFinite(Number(b.min)) ? Number(b.min) : null;
+      const max = b?.max != null && Number.isFinite(Number(b.max)) ? Number(b.max) : null;
+      if (min != null && total < min) continue;
+      if (max != null && total > max) continue;
+      if (typeof b?.label === 'string' && b.label.trim()) {
+        band = b.label.trim();
+        break;
+      }
+    }
+  }
+  return { score: total, band };
+}
+
 app.post('/api/v1/residents/:id/assessments', requireRole(ROLES_ASSESSMENTS_CREATE), async (req, res) => {
   const { id } = req.params;
   const scope = userHomeScope(req);
@@ -1831,7 +1971,7 @@ app.post('/api/v1/residents/:id/assessments', requireRole(ROLES_ASSESSMENTS_CREA
   const answersJson = body.answers_json ?? body.answersJson ?? null;
   const statusRaw = typeof body.status === 'string' ? body.status.trim().toUpperCase() : 'COMPLETED';
   const status = statusRaw === 'DRAFT' || statusRaw === 'COMPLETED' ? statusRaw : 'COMPLETED';
-  const score = body.score == null || body.score === '' ? null : Number(body.score);
+  const clientScore = body.score == null || body.score === '' ? null : Number(body.score);
   const reviewDateRaw = body.reviewDate ?? body.review_date ?? null;
   let reviewDate = null;
   if (reviewDateRaw) {
@@ -1841,9 +1981,27 @@ app.post('/api/v1/residents/:id/assessments', requireRole(ROLES_ASSESSMENTS_CREA
   }
   if (!templateId) return clientError(req, res, 400, 'templateId is required.');
   if (answersJson == null || typeof answersJson !== 'object') return clientError(req, res, 400, 'answers_json must be an object.');
-  if (score !== null && !Number.isFinite(score)) return clientError(req, res, 400, 'score must be a number.');
+  if (clientScore !== null && !Number.isFinite(clientScore)) return clientError(req, res, 400, 'score must be a number.');
 
   try {
+    const tmplRes = await pool.query(
+      `SELECT id, name, version, schema_json, scoring_json, is_active
+       FROM public.assessment_templates
+       WHERE id = $1::uuid`,
+      [templateId]
+    );
+    if (tmplRes.rows.length === 0) return clientError(req, res, 404, 'Template not found.');
+    const tmpl = tmplRes.rows[0];
+    if (tmpl.is_active === false) return clientError(req, res, 400, 'Template is inactive.');
+
+    const validationErrors = validateAnswersAgainstSchema(tmpl.schema_json, answersJson);
+    if (Object.keys(validationErrors).length > 0) {
+      return res.status(400).json({ error: 'Assessment answers did not pass validation.', details: validationErrors });
+    }
+
+    const scoring = computeScoreFromScoringJson(tmpl.scoring_json, answersJson);
+    const score = scoring.score != null ? scoring.score : clientScore;
+
     const ins = await pool.query(
       `INSERT INTO public.assessments (service_user_id, template_id, status, answers_json, score, review_date, created_by, created_at, updated_at)
        SELECT $1::uuid, $2::uuid, $3, $4::jsonb, $5::numeric, $6::date, $7::uuid, now(), now()
@@ -1859,10 +2017,18 @@ app.post('/api/v1/residents/:id/assessments', requireRole(ROLES_ASSESSMENTS_CREA
       action: 'ASSESSMENT_CREATE',
       resourceType: 'assessment',
       resourceId: ins.rows[0]?.id ?? null,
-      metadata: { serviceUserId: id, templateId, status, hasScore: score != null, hasReviewDate: Boolean(reviewDate) },
+      metadata: {
+        serviceUserId: id,
+        templateId,
+        status,
+        hasScore: score != null,
+        scoreSource: scoring.score != null ? 'computed' : clientScore != null ? 'client' : 'none',
+        hasReviewDate: Boolean(reviewDate),
+        hasBand: Boolean(scoring.band),
+      },
     });
 
-    res.status(201).json({ assessment: ins.rows[0] });
+    res.status(201).json({ assessment: ins.rows[0], computed: { band: scoring.band } });
   } catch (err) {
     logRequestError(req, err, 'assessment-create');
     clientError(req, res, 500, 'Could not save assessment.');
