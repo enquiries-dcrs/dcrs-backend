@@ -1103,7 +1103,7 @@ app.get('/api/v1/analytics/residents-export.csv', requireRole(ROLES_RESIDENT_REC
        LEFT JOIN beds b ON su.current_bed_id = b.id
        LEFT JOIN units u ON b.unit_id = u.id
        LEFT JOIN homes h ON su.home_id = h.id
-       WHERE su.status IN ('ADMITTED', 'DISCHARGED', 'PENDING', 'ARCHIVED')
+       WHERE su.status IN ('ADMITTED', 'DISCHARGED', 'PENDING')
          AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
        ORDER BY h.name NULLS LAST, su.last_name ASC NULLS LAST, su.first_name ASC NULLS LAST`,
       [filterHomeId]
