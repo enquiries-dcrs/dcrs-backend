@@ -384,6 +384,8 @@ const ROLES_DAILY_CARE_WRITE = ROLES_RESIDENT_AND_FACILITY_READ;
 const ROLES_PEEP_WRITE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_CARE_PLAN_EDIT = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_CARE_PLAN_ARCHIVE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_ASSESSMENT_TEMPLATES_EDIT = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+const ROLES_ASSESSMENTS_CREATE = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 
 app.use('/api/v1', authenticateToken);
 
@@ -1635,6 +1637,277 @@ app.post(
     }
   }
 );
+
+// ---------------------------------------------------------------------------
+// ASSESSMENTS (TEMPLATES + COMPLETED) — SCOPED
+// ---------------------------------------------------------------------------
+
+app.get('/api/v1/assessment-templates', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, version, schema_json, scoring_json, is_active, created_by, updated_by, created_at, updated_at
+       FROM public.assessment_templates
+       ORDER BY is_active DESC, name ASC, version DESC`
+    );
+    await writeAuditLog(req, {
+      action: 'ASSESSMENT_TEMPLATE_LIST_VIEW',
+      resourceType: 'assessment_template',
+      metadata: { resultCount: rows.length },
+    });
+    res.json({ templates: rows });
+  } catch (err) {
+    if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+      const code = err.code;
+      const msg = err.message || '';
+      if (code === '42P01' || /assessment_templates/i.test(String(msg))) {
+        return clientError(
+          req,
+          res,
+          503,
+          'Assessment templates are not available yet (database migration not applied). Run the assessment templates SQL migration in Supabase and retry.'
+        );
+      }
+    }
+    logRequestError(req, err, 'assessment-templates-list');
+    clientError(req, res, 500, 'Unable to load assessment templates.');
+  }
+});
+
+app.post('/api/v1/assessment-templates', requireRole(ROLES_ASSESSMENT_TEMPLATES_EDIT), async (req, res) => {
+  const body = req.body || {};
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const schemaJson = body.schema_json ?? body.schemaJson ?? null;
+  const scoringJson = body.scoring_json ?? body.scoringJson ?? null;
+  if (!name) return clientError(req, res, 400, 'name is required.');
+  if (name.length > 200) return clientError(req, res, 400, 'name is too long.');
+  if (schemaJson == null || typeof schemaJson !== 'object') return clientError(req, res, 400, 'schema_json must be an object.');
+
+  try {
+    const ins = await pool.query(
+      `INSERT INTO public.assessment_templates (name, version, schema_json, scoring_json, is_active, created_by, updated_by, created_at, updated_at)
+       VALUES ($1, 1, $2::jsonb, $3::jsonb, true, $4::uuid, $4::uuid, now(), now())
+       RETURNING *`,
+      [name, JSON.stringify(schemaJson), scoringJson == null ? null : JSON.stringify(scoringJson), req.dbUser?.id ?? null]
+    );
+    await writeAuditLog(req, {
+      action: 'ASSESSMENT_TEMPLATE_CREATE',
+      resourceType: 'assessment_template',
+      resourceId: ins.rows[0]?.id ?? null,
+      metadata: { name },
+    });
+    res.status(201).json({ template: ins.rows[0] });
+  } catch (err) {
+    logRequestError(req, err, 'assessment-template-create');
+    clientError(req, res, 500, 'Could not create assessment template.');
+  }
+});
+
+app.patch('/api/v1/assessment-templates/:templateId', requireRole(ROLES_ASSESSMENT_TEMPLATES_EDIT), async (req, res) => {
+  const { templateId } = req.params;
+  const body = req.body || {};
+  const name = typeof body.name === 'string' ? body.name.trim() : null;
+  const schemaJson =
+    Object.prototype.hasOwnProperty.call(body, 'schema_json') || Object.prototype.hasOwnProperty.call(body, 'schemaJson')
+      ? (body.schema_json ?? body.schemaJson)
+      : null;
+  const scoringJson =
+    Object.prototype.hasOwnProperty.call(body, 'scoring_json') || Object.prototype.hasOwnProperty.call(body, 'scoringJson')
+      ? (body.scoring_json ?? body.scoringJson)
+      : undefined;
+  const isActive =
+    Object.prototype.hasOwnProperty.call(body, 'is_active') || Object.prototype.hasOwnProperty.call(body, 'isActive')
+      ? Boolean(body.is_active ?? body.isActive)
+      : null;
+  const bumpVersion = Boolean(body.bumpVersion);
+
+  if (name !== null && name.length === 0) return clientError(req, res, 400, 'name cannot be empty.');
+  if (name !== null && name.length > 200) return clientError(req, res, 400, 'name is too long.');
+  if (schemaJson !== null && (schemaJson == null || typeof schemaJson !== 'object')) {
+    return clientError(req, res, 400, 'schema_json must be an object.');
+  }
+  if (scoringJson !== undefined && scoringJson !== null && typeof scoringJson !== 'object') {
+    return clientError(req, res, 400, 'scoring_json must be an object or null.');
+  }
+
+  try {
+    const up = await pool.query(
+      `UPDATE public.assessment_templates
+       SET
+         name = COALESCE($1, name),
+         schema_json = COALESCE($2::jsonb, schema_json),
+         scoring_json = CASE WHEN $3::text IS NULL THEN scoring_json ELSE $3::jsonb END,
+         is_active = COALESCE($4::boolean, is_active),
+         version = CASE WHEN $5::boolean THEN version + 1 ELSE version END,
+         updated_by = $6::uuid,
+         updated_at = now()
+       WHERE id = $7::uuid
+       RETURNING *`,
+      [
+        name,
+        schemaJson === null ? null : JSON.stringify(schemaJson),
+        scoringJson === undefined ? null : scoringJson === null ? 'null' : JSON.stringify(scoringJson),
+        isActive,
+        bumpVersion,
+        req.dbUser?.id ?? null,
+        templateId,
+      ]
+    );
+    if (up.rows.length === 0) return clientError(req, res, 404, 'Template not found.');
+    await writeAuditLog(req, {
+      action: 'ASSESSMENT_TEMPLATE_UPDATE',
+      resourceType: 'assessment_template',
+      resourceId: templateId,
+      metadata: { changedName: name != null, changedSchema: schemaJson != null, changedActive: isActive != null, bumpVersion },
+    });
+    res.json({ template: up.rows[0] });
+  } catch (err) {
+    logRequestError(req, err, 'assessment-template-update');
+    clientError(req, res, 500, 'Could not update assessment template.');
+  }
+});
+
+app.get('/api/v1/residents/:id/assessments', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  try {
+    const scopeCheck = await pool.query(
+      `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+      [id, scope]
+    );
+    if (scopeCheck.rows.length === 0) return clientError(req, res, 403, 'Access denied to this resident');
+
+    const { rows } = await pool.query(
+      `SELECT
+         a.id,
+         a.service_user_id,
+         a.template_id,
+         a.status,
+         a.answers_json,
+         a.score,
+         a.review_date,
+         a.created_by,
+         a.created_at,
+         at.name AS template_name,
+         at.version AS template_version
+       FROM public.assessments a
+       INNER JOIN public.assessment_templates at ON at.id = a.template_id
+       INNER JOIN public.service_users su ON su.id = a.service_user_id
+       WHERE a.service_user_id = $1::uuid
+         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+       ORDER BY a.created_at DESC
+       LIMIT 200`,
+      [id, scope]
+    );
+    await writeAuditLog(req, {
+      action: 'ASSESSMENT_LIST_VIEW',
+      resourceType: 'service_user',
+      resourceId: id,
+      metadata: { resultCount: rows.length },
+    });
+    res.json({ assessments: rows });
+  } catch (err) {
+    if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+      const code = err.code;
+      const msg = err.message || '';
+      if (code === '42P01' || /assessments|assessment_templates/i.test(String(msg))) {
+        return clientError(
+          req,
+          res,
+          503,
+          'Assessments are not available yet (database migration not applied). Run the assessments SQL migrations in Supabase and retry.'
+        );
+      }
+    }
+    logRequestError(req, err, 'assessments-list');
+    clientError(req, res, 500, 'Unable to load assessments.');
+  }
+});
+
+app.post('/api/v1/residents/:id/assessments', requireRole(ROLES_ASSESSMENTS_CREATE), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  const body = req.body || {};
+  const templateId = typeof body.templateId === 'string' ? body.templateId.trim() : '';
+  const answersJson = body.answers_json ?? body.answersJson ?? null;
+  const statusRaw = typeof body.status === 'string' ? body.status.trim().toUpperCase() : 'COMPLETED';
+  const status = statusRaw === 'DRAFT' || statusRaw === 'COMPLETED' ? statusRaw : 'COMPLETED';
+  const score = body.score == null || body.score === '' ? null : Number(body.score);
+  const reviewDateRaw = body.reviewDate ?? body.review_date ?? null;
+  let reviewDate = null;
+  if (reviewDateRaw) {
+    const s = String(reviewDateRaw).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'reviewDate must be YYYY-MM-DD.');
+    reviewDate = s;
+  }
+  if (!templateId) return clientError(req, res, 400, 'templateId is required.');
+  if (answersJson == null || typeof answersJson !== 'object') return clientError(req, res, 400, 'answers_json must be an object.');
+  if (score !== null && !Number.isFinite(score)) return clientError(req, res, 400, 'score must be a number.');
+
+  try {
+    const ins = await pool.query(
+      `INSERT INTO public.assessments (service_user_id, template_id, status, answers_json, score, review_date, created_by, created_at, updated_at)
+       SELECT $1::uuid, $2::uuid, $3, $4::jsonb, $5::numeric, $6::date, $7::uuid, now(), now()
+       FROM public.service_users su
+       WHERE su.id = $1::uuid
+         AND (CAST($8 AS uuid) IS NULL OR su.home_id = CAST($8 AS uuid))
+       RETURNING id, service_user_id, template_id, status, answers_json, score, review_date, created_by, created_at`,
+      [id, templateId, status, JSON.stringify(answersJson), score, reviewDate, req.dbUser?.id ?? null, scope]
+    );
+    if (ins.rows.length === 0) return clientError(req, res, 403, 'Access denied to this resident');
+
+    await writeAuditLog(req, {
+      action: 'ASSESSMENT_CREATE',
+      resourceType: 'assessment',
+      resourceId: ins.rows[0]?.id ?? null,
+      metadata: { serviceUserId: id, templateId, status, hasScore: score != null, hasReviewDate: Boolean(reviewDate) },
+    });
+
+    res.status(201).json({ assessment: ins.rows[0] });
+  } catch (err) {
+    logRequestError(req, err, 'assessment-create');
+    clientError(req, res, 500, 'Could not save assessment.');
+  }
+});
+
+app.get('/api/v1/assessments/:assessmentId', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { assessmentId } = req.params;
+  const scope = userHomeScope(req);
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         a.id,
+         a.service_user_id,
+         a.template_id,
+         a.status,
+         a.answers_json,
+         a.score,
+         a.review_date,
+         a.created_by,
+         a.created_at,
+         at.name AS template_name,
+         at.version AS template_version,
+         at.schema_json,
+         at.scoring_json
+       FROM public.assessments a
+       INNER JOIN public.assessment_templates at ON at.id = a.template_id
+       INNER JOIN public.service_users su ON su.id = a.service_user_id
+       WHERE a.id = $1::uuid
+         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+      [assessmentId, scope]
+    );
+    if (rows.length === 0) return clientError(req, res, 404, 'Assessment not found.');
+    await writeAuditLog(req, {
+      action: 'ASSESSMENT_VIEW',
+      resourceType: 'assessment',
+      resourceId: assessmentId,
+      metadata: {},
+    });
+    res.json({ assessment: rows[0] });
+  } catch (err) {
+    logRequestError(req, err, 'assessment-view');
+    clientError(req, res, 500, 'Unable to load assessment.');
+  }
+});
 
 // ---------------------------------------------------------------------------
 // TASKS (SCOPED TO RESIDENT + HOME)
