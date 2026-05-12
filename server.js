@@ -421,6 +421,398 @@ function oneLine(s) {
     .trim();
 }
 
+function parseLeadingNumberFromObservationValue(valueRaw) {
+  const m = String(valueRaw ?? '').match(/-?\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = parseFloat(m[0]);
+  return Number.isFinite(n) ? n : null;
+}
+
+const CLINICAL_RISK_SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
+
+function sortClinicalRiskItems(items) {
+  return [...items].sort(
+    (a, b) =>
+      (CLINICAL_RISK_SEVERITY_ORDER[a.severity] ?? 9) - (CLINICAL_RISK_SEVERITY_ORDER[b.severity] ?? 9)
+  );
+}
+
+function clampClinicalRiskAckHours(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return null;
+  return Math.min(168, Math.max(1, Math.round(x)));
+}
+
+/**
+ * Per-home override: homes.metadata.clinicalRiskReview.ackCooldownHours (1–168),
+ * or legacy homes.metadata.clinicalRiskAckCooldownHours.
+ */
+function ackCooldownHoursFromHomeMetadata(metadata, fallbackHours) {
+  const fb = clampClinicalRiskAckHours(fallbackHours) ?? 48;
+  if (!metadata || typeof metadata !== 'object') return fb;
+  const nested = metadata.clinicalRiskReview;
+  if (nested && typeof nested === 'object' && nested.ackCooldownHours != null) {
+    const c = clampClinicalRiskAckHours(nested.ackCooldownHours);
+    if (c != null) return c;
+  }
+  if (metadata.clinicalRiskAckCooldownHours != null) {
+    const c = clampClinicalRiskAckHours(metadata.clinicalRiskAckCooldownHours);
+    if (c != null) return c;
+  }
+  return fb;
+}
+
+/**
+ * Rule-based clinical risk & review inbox (not predictive ML).
+ * Each item carries a stable `fingerprint` for POST acknowledgement + cooldown suppression.
+ * Cooldown hours default from options; each home can override via homes.metadata (see sql/024).
+ */
+async function assembleClinicalRiskReviewItems(scope, options = {}) {
+  const defaultAckHours = clampClinicalRiskAckHours(options.defaultAckCooldownHours) ?? 48;
+  const items = [];
+  const warnings = [];
+  const homeAckCooldownByHomeId = {};
+  const homeCooldownMap = new Map();
+  let ackRows = [];
+
+  try {
+    const { rows: homeRows } = await pool.query(
+      `SELECT id, name, COALESCE(metadata, '{}'::jsonb) AS metadata
+       FROM public.homes
+       WHERE (CAST($1 AS uuid) IS NULL OR id = CAST($1 AS uuid))
+       ORDER BY name ASC NULLS LAST`,
+      [scope]
+    );
+    for (const h of homeRows) {
+      const hid = String(h.id);
+      const hrs = ackCooldownHoursFromHomeMetadata(h.metadata, defaultAckHours);
+      homeCooldownMap.set(hid, hrs);
+      homeAckCooldownByHomeId[hid] = { homeName: h.name || null, ackCooldownHours: hrs };
+    }
+  } catch (err) {
+    if (String(err.code || '') === '42703' || /metadata/i.test(String(err.message))) {
+      warnings.push(
+        'homes.metadata column missing — run backend/sql/024_homes_metadata_risk_ack_home.sql. Using default acknowledgement cooldown only.'
+      );
+      homeCooldownMap.clear();
+    } else {
+      console.error('[clinical-risk-homes-meta]', err);
+      warnings.push('Could not load home metadata for acknowledgement cooldowns.');
+    }
+  }
+
+  function resolveAckHoursForHome(homeId) {
+    if (homeId && homeCooldownMap.has(String(homeId))) return homeCooldownMap.get(String(homeId));
+    return defaultAckHours;
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT fingerprint, created_at
+       FROM public.risk_review_acknowledgements
+       WHERE created_at >= now() - interval '168 hours'`
+    );
+    ackRows = rows;
+  } catch (err) {
+    if (String(err.code || '') === '42P01' || /risk_review_acknowledgements/i.test(String(err.message))) {
+      warnings.push(
+        'Acknowledgements table is not installed yet. Run backend/sql/023_risk_review_acknowledgements.sql — review items still show, but “Acknowledge” will fail until then.'
+      );
+      ackRows = [];
+    } else {
+      throw err;
+    }
+  }
+
+  function latestAckMs(fingerprint) {
+    let latest = 0;
+    for (const a of ackRows) {
+      if (String(a.fingerprint) !== String(fingerprint)) continue;
+      const t = new Date(a.created_at).getTime();
+      if (!Number.isNaN(t) && t > latest) latest = t;
+    }
+    return latest;
+  }
+
+  function isSuppressedByAck(fingerprint, homeId) {
+    const latest = latestAckMs(fingerprint);
+    if (!latest) return false;
+    const cd = resolveAckHoursForHome(homeId);
+    return Date.now() - latest < cd * 3600000;
+  }
+
+  function pushItem(item) {
+    if (!item?.fingerprint) return;
+    if (isSuppressedByAck(item.fingerprint, item.homeId)) return;
+    const hrs = resolveAckHoursForHome(item.homeId);
+    items.push({ ...item, ackCooldownHours: hrs });
+  }
+
+  const residentLabel = (fn, ln) =>
+    `${String(fn || '').trim()} ${String(ln || '').trim()}`.trim() || 'Service user';
+
+  // --- Overdue high / critical tasks (per task) ---
+  try {
+    const { rows: taskRows } = await pool.query(
+      `SELECT t.id, t.title, t.priority, t.due_date, t.service_user_id,
+              su.first_name AS rf, su.last_name AS rl, su.home_id, h.name AS home_name
+       FROM tasks t
+       INNER JOIN service_users su ON su.id = t.service_user_id
+       LEFT JOIN homes h ON h.id = su.home_id
+       WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+         AND su.status = 'ADMITTED'
+         AND t.due_date IS NOT NULL
+         AND t.due_date::date < (timezone('UTC', now()))::date
+         AND lower(trim(coalesce(t.status, ''))) NOT IN ('completed', 'done')
+         AND lower(trim(coalesce(t.priority, ''))) IN ('high', 'critical')
+       ORDER BY t.due_date ASC NULLS LAST
+       LIMIT 100`,
+      [scope]
+    );
+    for (const t of taskRows) {
+      const pr = String(t.priority || '').trim().toLowerCase();
+      const sev = pr === 'critical' ? 'critical' : 'high';
+      const dueStr = t.due_date
+        ? new Date(t.due_date).toLocaleDateString('en-GB', { timeZone: 'UTC' })
+        : 'unknown';
+      pushItem({
+        fingerprint: `OVERDUE_HIGH_TASK:${t.id}`,
+        severity: sev,
+        category: 'TASK_ESCALATION',
+        type: 'OVERDUE_HIGH_PRIORITY_TASK',
+        title: `Overdue ${pr === 'critical' ? 'critical' : 'high'}-priority task`,
+        detail: `${oneLine(t.title) || 'Task'} — due ${dueStr}.`,
+        serviceUserId: String(t.service_user_id),
+        residentName: residentLabel(t.rf, t.rl),
+        homeId: t.home_id ? String(t.home_id) : null,
+        homeName: t.home_name || null,
+        ref: { type: 'task', id: String(t.id) },
+        suggestedActions: [
+          'Resolve or re-date the task on the resident chart (Tasks tab).',
+          'If care was delayed for a clinical reason, record it in daily notes.',
+        ],
+      });
+    }
+  } catch (err) {
+    console.error('[clinical-risk-tasks-high]', err);
+    warnings.push('Could not evaluate overdue high-priority tasks.');
+  }
+
+  // --- Many overdue open tasks per resident (coordination risk) ---
+  try {
+    const { rows: backRows } = await pool.query(
+      `SELECT t.service_user_id, COUNT(*)::int AS cnt,
+              su.first_name AS rf, su.last_name AS rl, su.home_id, h.name AS home_name
+       FROM tasks t
+       INNER JOIN service_users su ON su.id = t.service_user_id
+       LEFT JOIN homes h ON h.id = su.home_id
+       WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+         AND su.status = 'ADMITTED'
+         AND t.due_date IS NOT NULL
+         AND t.due_date::date < (timezone('UTC', now()))::date
+         AND lower(trim(coalesce(t.status, ''))) NOT IN ('completed', 'done')
+       GROUP BY t.service_user_id, su.first_name, su.last_name, su.home_id, h.name
+       HAVING COUNT(*) >= 5
+       ORDER BY cnt DESC
+       LIMIT 40`,
+      [scope]
+    );
+    for (const b of backRows) {
+      pushItem({
+        fingerprint: `TASK_BACKLOG:${b.service_user_id}`,
+        severity: 'medium',
+        category: 'TASK_COORDINATION',
+        type: 'OVERDUE_TASK_BACKLOG',
+        title: 'Large backlog of overdue open tasks',
+        detail: `${residentLabel(b.rf, b.rl)} has ${b.cnt} overdue tasks that are still open — review workload and priorities.`,
+        serviceUserId: String(b.service_user_id),
+        residentName: residentLabel(b.rf, b.rl),
+        homeId: b.home_id ? String(b.home_id) : null,
+        homeName: b.home_name || null,
+        ref: { type: 'service_user', id: String(b.service_user_id) },
+        suggestedActions: [
+          'Open the Tasks tab and triage: complete, delegate, or set realistic new dates.',
+          'Consider a multidisciplinary huddle if this pattern persists.',
+        ],
+      });
+    }
+  } catch (err) {
+    console.error('[clinical-risk-task-backlog]', err);
+    warnings.push('Could not evaluate overdue task backlog.');
+  }
+
+  // --- Recent temperature (48h) ---
+  try {
+    const { rows: tempRows } = await pool.query(
+      `SELECT DISTINCT ON (o.service_user_id)
+         o.service_user_id, o.value, o.recorded_at, o.id AS observation_id,
+         su.first_name AS rf, su.last_name AS rl, su.home_id, h.name AS home_name
+       FROM observations o
+       INNER JOIN service_users su ON su.id = o.service_user_id
+       LEFT JOIN homes h ON h.id = su.home_id
+       WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+         AND su.status = 'ADMITTED'
+         AND lower(trim(coalesce(o.observation_type::text, ''))) IN ('temp', 'temperature')
+         AND o.recorded_at >= now() - interval '48 hours'
+       ORDER BY o.service_user_id, o.recorded_at DESC`,
+      [scope]
+    );
+    for (const row of tempRows) {
+      const v = parseLeadingNumberFromObservationValue(row.value);
+      if (v == null) continue;
+      let severity = null;
+      if (v >= 39.0) severity = 'critical';
+      else if (v >= 38.0) severity = 'high';
+      else if (v >= 37.5) severity = 'medium';
+      if (!severity) continue;
+      pushItem({
+        fingerprint: `TEMP_ELEVATED_48H:${row.service_user_id}`,
+        severity,
+        category: 'VITALS',
+        type: 'TEMPERATURE_ELEVATED_RECENT',
+        title: 'Elevated temperature (recent charting)',
+        detail: `${residentLabel(row.rf, row.rl)} — latest temperature ${v}°C recorded ${row.recorded_at ? new Date(row.recorded_at).toLocaleString('en-GB') : 'recently'}.`,
+        serviceUserId: String(row.service_user_id),
+        residentName: residentLabel(row.rf, row.rl),
+        homeId: row.home_id ? String(row.home_id) : null,
+        homeName: row.home_name || null,
+        ref: { type: 'observation', id: String(row.observation_id) },
+        suggestedActions: [
+          'Follow local infection prevention and escalation policy.',
+          'Repeat observations and review associated notes and MAR.',
+        ],
+      });
+    }
+  } catch (err) {
+    if (String(err.code || '') === '42P01' || /observations/i.test(String(err.message))) {
+      warnings.push('Observations table unavailable — temperature rules skipped.');
+    } else {
+      console.error('[clinical-risk-temp]', err);
+      warnings.push('Could not evaluate recent temperature observations.');
+    }
+  }
+
+  // --- Recent SpO₂ (48h) ---
+  try {
+    const { rows: spoRows } = await pool.query(
+      `SELECT DISTINCT ON (o.service_user_id)
+         o.service_user_id, o.value, o.recorded_at, o.id AS observation_id,
+         su.first_name AS rf, su.last_name AS rl, su.home_id, h.name AS home_name
+       FROM observations o
+       INNER JOIN service_users su ON su.id = o.service_user_id
+       LEFT JOIN homes h ON h.id = su.home_id
+       WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+         AND su.status = 'ADMITTED'
+         AND lower(trim(coalesce(o.observation_type::text, ''))) IN ('spo2', 'sp02')
+         AND o.recorded_at >= now() - interval '48 hours'
+       ORDER BY o.service_user_id, o.recorded_at DESC`,
+      [scope]
+    );
+    for (const row of spoRows) {
+      const v = parseLeadingNumberFromObservationValue(row.value);
+      if (v == null) continue;
+      let severity = null;
+      if (v < 88) severity = 'critical';
+      else if (v < 92) severity = 'high';
+      else if (v < 94) severity = 'medium';
+      if (!severity) continue;
+      pushItem({
+        fingerprint: `SPO2_LOW_48H:${row.service_user_id}`,
+        severity,
+        category: 'VITALS',
+        type: 'SPO2_LOW_RECENT',
+        title: 'Low oxygen saturation (recent charting)',
+        detail: `${residentLabel(row.rf, row.rl)} — latest SpO₂ ${v}% recorded ${row.recorded_at ? new Date(row.recorded_at).toLocaleString('en-GB') : 'recently'}.`,
+        serviceUserId: String(row.service_user_id),
+        residentName: residentLabel(row.rf, row.rl),
+        homeId: row.home_id ? String(row.home_id) : null,
+        homeName: row.home_name || null,
+        ref: { type: 'observation', id: String(row.observation_id) },
+        suggestedActions: [
+          'Confirm device and resident state; escalate per local respiratory distress protocol.',
+          'Review observations trend and clinician/GP involvement where indicated.',
+        ],
+      });
+    }
+  } catch (err) {
+    if (String(err.code || '') === '42P01' || /observations/i.test(String(err.message))) {
+      /* already warned */
+    } else {
+      console.error('[clinical-risk-spo2]', err);
+      warnings.push('Could not evaluate recent SpO₂ observations.');
+    }
+  }
+
+  // --- PEEP review dates ---
+  try {
+    const { rows: peepRows } = await pool.query(
+      `SELECT pd.service_user_id, pd.review_date, pd.updated_at,
+              su.first_name AS rf, su.last_name AS rl, su.home_id, h.name AS home_name
+       FROM peep_documents pd
+       INNER JOIN service_users su ON su.id = pd.service_user_id
+       LEFT JOIN homes h ON h.id = su.home_id
+       WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+         AND su.status = 'ADMITTED'
+         AND pd.review_date IS NOT NULL
+         AND pd.review_date <= (CURRENT_DATE + interval '14 days')
+       ORDER BY pd.review_date ASC
+       LIMIT 80`,
+      [scope]
+    );
+    for (const row of peepRows) {
+      const rd = row.review_date;
+      if (!rd) continue;
+      const rdDate = new Date(`${String(rd).slice(0, 10)}T12:00:00Z`);
+      const todayUtc = new Date();
+      const todayMid = new Date(
+        `${todayUtc.getUTCFullYear()}-${String(todayUtc.getUTCMonth() + 1).padStart(2, '0')}-${String(todayUtc.getUTCDate()).padStart(2, '0')}T12:00:00Z`
+      );
+      const overdue = rdDate.getTime() < todayMid.getTime();
+      const sev = overdue ? 'high' : 'medium';
+      const fp = overdue ? `PEEP_REVIEW_OVERDUE:${row.service_user_id}` : `PEEP_REVIEW_DUE_SOON:${row.service_user_id}`;
+      pushItem({
+        fingerprint: fp,
+        severity: sev,
+        category: 'SAFETY_PLANNING',
+        type: overdue ? 'PEEP_REVIEW_OVERDUE' : 'PEEP_REVIEW_DUE_SOON',
+        title: overdue ? 'PEEP review date has passed' : 'PEEP review due within 14 days',
+        detail: `${residentLabel(row.rf, row.rl)} — review date ${new Date(rd).toLocaleDateString('en-GB', { timeZone: 'UTC' })}.`,
+        serviceUserId: String(row.service_user_id),
+        residentName: residentLabel(row.rf, row.rl),
+        homeId: row.home_id ? String(row.home_id) : null,
+        homeName: row.home_name || null,
+        ref: { type: 'peep', id: String(row.service_user_id) },
+        suggestedActions: [
+          'Open the PEEP tab, confirm evacuation arrangements, and set the next review date.',
+          'Upload a refreshed PEEP document if your governance model requires it.',
+        ],
+      });
+    }
+  } catch (err) {
+    if (String(err.code || '') === '42P01' || /peep_documents/i.test(String(err.message))) {
+      warnings.push('PEEP table unavailable — PEEP review rules skipped.');
+    } else {
+      console.error('[clinical-risk-peep]', err);
+      warnings.push('Could not evaluate PEEP review dates.');
+    }
+  }
+
+  return {
+    items: sortClinicalRiskItems(items),
+    methodology: [
+      'This inbox applies transparent, deterministic rules to existing operational data (tasks, observations, PEEP).',
+      'It is not a predictive AI model and must not replace clinical judgement or local policy.',
+      'Thresholds (examples): overdue high/critical tasks; ≥5 overdue open tasks per resident; temperature ≥37.5°C within 48h (severity rises ≥38°C / ≥39°C); SpO₂ <94% / <92% / <88% within 48h; PEEP review within 14 days or overdue.',
+      `Acknowledgement cooldown is per home via homes.metadata JSON: set clinicalRiskReview.ackCooldownHours (integer 1–168). If unset, the API default (${defaultAckHours}h) applies. Optional query ?defaultAckCooldownHours= overrides that fallback when a home has no metadata.`,
+      'GET /api/v1/clinical-risk-review returns homeAckCooldownByHomeId with resolved hours per home in your scope.',
+    ],
+    defaultAckCooldownHours: defaultAckHours,
+    homeAckCooldownByHomeId,
+    warnings,
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 app.get('/', (req, res) => {
   res.json({ status: 'online', message: 'DCRS Secured API is running!' });
 });
@@ -4887,6 +5279,162 @@ app.get('/api/v1/tasks', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (r
 });
 
 // ---------------------------------------------------------------------------
+// Clinical risk & review inbox (deterministic rules — not predictive AI)
+// ---------------------------------------------------------------------------
+async function validateRiskReviewAcknowledgement(fingerprint, serviceUserId, scope) {
+  const fp = String(fingerprint || '').trim();
+  const su = String(serviceUserId || '').trim();
+  if (!UUID_RE.test(su)) return { ok: false, message: 'serviceUserId must be a UUID.' };
+  const p = fp.indexOf(':');
+  if (p < 1) return { ok: false, message: 'Invalid fingerprint.' };
+  const kind = fp.slice(0, p);
+  const suffix = fp.slice(p + 1).trim();
+  if (!UUID_RE.test(suffix)) return { ok: false, message: 'Invalid fingerprint suffix.' };
+
+  const suRow = await pool.query(
+    `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+    [su, scope]
+  );
+  if (suRow.rows.length === 0) return { ok: false, message: 'Service user not in scope.' };
+
+  if (kind === 'OVERDUE_HIGH_TASK') {
+    const tq = await pool.query(
+      `SELECT t.service_user_id
+       FROM tasks t
+       INNER JOIN service_users su ON su.id = t.service_user_id
+       WHERE t.id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+       LIMIT 1`,
+      [suffix, scope]
+    );
+    if (tq.rows.length === 0) return { ok: false, message: 'Task not found in scope.' };
+    if (String(tq.rows[0].service_user_id).toLowerCase() !== su.toLowerCase()) {
+      return { ok: false, message: 'Fingerprint does not match service user.' };
+    }
+    return { ok: true };
+  }
+
+  if (String(suffix).toLowerCase() !== su.toLowerCase()) {
+    return { ok: false, message: 'Fingerprint does not match service user.' };
+  }
+
+  const allowed = new Set([
+    'TASK_BACKLOG',
+    'TEMP_ELEVATED_48H',
+    'SPO2_LOW_48H',
+    'PEEP_REVIEW_OVERDUE',
+    'PEEP_REVIEW_DUE_SOON',
+  ]);
+  if (!allowed.has(kind)) return { ok: false, message: 'Unknown fingerprint kind.' };
+  return { ok: true };
+}
+
+app.get('/api/v1/clinical-risk-review', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const scope = userHomeScope(req);
+  try {
+    const defRaw =
+      req.query?.defaultAckCooldownHours ?? req.query?.ackCooldownHours ?? req.query?.ack_hours;
+    const defaultAckCooldownHours = Math.min(168, Math.max(1, parseInt(String(defRaw ?? '48'), 10) || 48));
+    const payload = await assembleClinicalRiskReviewItems(scope, { defaultAckCooldownHours });
+    await writeAuditLog(req, {
+      action: 'CLINICAL_RISK_REVIEW_VIEW',
+      resourceType: 'clinical_risk_review',
+      metadata: {
+        itemCount: payload.items.length,
+        defaultAckCooldownHours: payload.defaultAckCooldownHours,
+        homesWithPolicy: Object.keys(payload.homeAckCooldownByHomeId || {}).length,
+      },
+    });
+    res.json(payload);
+  } catch (err) {
+    logRequestError(req, err, 'clinical-risk-review-get');
+    clientError(req, res, 500, 'Unable to load clinical risk review inbox.');
+  }
+});
+
+app.post('/api/v1/clinical-risk-review/acknowledge', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const scope = userHomeScope(req);
+  const body = req.body || {};
+  const fingerprint = typeof body.fingerprint === 'string' ? body.fingerprint.trim() : '';
+  const serviceUserId = typeof body.serviceUserId === 'string' ? body.serviceUserId.trim() : '';
+  let note = typeof body.note === 'string' ? body.note.trim() : '';
+  if (note.length > 2000) note = note.slice(0, 2000);
+
+  if (!fingerprint || !serviceUserId) {
+    return clientError(req, res, 400, 'fingerprint and serviceUserId are required.');
+  }
+
+  const v = await validateRiskReviewAcknowledgement(fingerprint, serviceUserId, scope);
+  if (!v.ok) return clientError(req, res, 400, v.message);
+
+  let homeIdAck = null;
+  try {
+    const homeRow = await pool.query(
+      `SELECT home_id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid)) LIMIT 1`,
+      [serviceUserId, scope]
+    );
+    homeIdAck = homeRow.rows[0]?.home_id ?? null;
+  } catch (e) {
+    /* non-fatal */
+  }
+
+  try {
+    let ins;
+    try {
+      ins = await pool.query(
+        `INSERT INTO public.risk_review_acknowledgements
+           (actor_user_id, actor_email, fingerprint, service_user_id, home_id, note)
+         VALUES ($1::uuid, $2, $3, $4::uuid, $5::uuid, NULLIF($6, ''))
+         RETURNING id, created_at`,
+        [
+          req.dbUser?.id ?? null,
+          req.dbUser?.email ?? req.user?.email ?? null,
+          fingerprint,
+          serviceUserId,
+          homeIdAck,
+          note,
+        ]
+      );
+    } catch (e0) {
+      if (String(e0.code || '') === '42703' && /home_id/i.test(String(e0.message))) {
+        ins = await pool.query(
+          `INSERT INTO public.risk_review_acknowledgements
+             (actor_user_id, actor_email, fingerprint, service_user_id, note)
+           VALUES ($1::uuid, $2, $3, $4::uuid, NULLIF($5, ''))
+           RETURNING id, created_at`,
+          [
+            req.dbUser?.id ?? null,
+            req.dbUser?.email ?? req.user?.email ?? null,
+            fingerprint,
+            serviceUserId,
+            note,
+          ]
+        );
+      } else {
+        throw e0;
+      }
+    }
+    await writeAuditLog(req, {
+      action: 'CLINICAL_RISK_REVIEW_ACK',
+      resourceType: 'service_user',
+      resourceId: serviceUserId,
+      metadata: { fingerprint, note: note || null, homeId: homeIdAck },
+    });
+    res.status(201).json({ success: true, acknowledgement: ins.rows[0] });
+  } catch (err) {
+    if (String(err.code || '') === '42P01' || /risk_review_acknowledgements/i.test(String(err.message))) {
+      return clientError(
+        req,
+        res,
+        503,
+        'Acknowledgements table is not installed. Run backend/sql/023_risk_review_acknowledgements.sql in the database.'
+      );
+    }
+    logRequestError(req, err, 'clinical-risk-review-ack');
+    clientError(req, res, 500, 'Could not record acknowledgement.');
+  }
+});
+
+// ---------------------------------------------------------------------------
 // FOOD & DRINK CHART (DAILY, SCOPED)
 // ---------------------------------------------------------------------------
 app.get(
@@ -5326,6 +5874,262 @@ app.post(
 );
 
 // ---------------------------------------------------------------------------
+// TOPICAL MEDICINES — application record sheet (body map, scoped)
+// ---------------------------------------------------------------------------
+const TOPICAL_BODY_REGION_IDS = new Set([
+  'head',
+  'neck',
+  'chest',
+  'abdomen',
+  'left_upper_arm',
+  'right_upper_arm',
+  'left_forearm',
+  'right_forearm',
+  'left_hand',
+  'right_hand',
+  'left_thigh',
+  'right_thigh',
+  'left_shin',
+  'right_shin',
+  'left_foot',
+  'right_foot',
+  'groin',
+  'upper_back',
+  'mid_back',
+  'lower_back',
+  'left_buttock',
+  'right_buttock',
+  'left_calf_back',
+  'right_calf_back',
+]);
+
+function normalizeTopicalBodyRegions(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const x of raw) {
+    const s = String(x || '').trim();
+    if (!s || !TOPICAL_BODY_REGION_IDS.has(s)) continue;
+    if (!out.includes(s)) out.push(s);
+    if (out.length >= 24) break;
+  }
+  return out;
+}
+
+app.get(
+  '/api/v1/residents/:id/topical-applications',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const dateRaw = typeof req.query?.date === 'string' ? req.query.date.trim() : null;
+
+    let chartDate = null;
+    if (dateRaw) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateRaw)) {
+        return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      }
+      chartDate = dateRaw;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      const q = `
+        SELECT tar.*
+        FROM topical_application_records tar
+        INNER JOIN service_users su ON su.id = tar.service_user_id
+        WHERE tar.service_user_id = $1::uuid
+          AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+          AND ($3::date IS NULL OR tar.chart_date = $3::date)
+        ORDER BY tar.applied_at DESC, tar.created_at DESC
+        LIMIT 200
+      `;
+      const rows = (await pool.query(q, [id, scope, chartDate])).rows || [];
+      res.json({
+        date: chartDate,
+        allowedBodyRegions: [...TOPICAL_BODY_REGION_IDS].sort(),
+        entries: rows.map((r) => ({
+          id: r.id,
+          chartDate: r.chart_date,
+          appliedAt: r.applied_at,
+          medicationName: r.medication_name,
+          medicationId: r.medication_id,
+          bodyRegions: Array.isArray(r.body_regions) ? r.body_regions : [],
+          siteNotes: r.site_notes,
+          batchLot: r.batch_lot,
+          recordedBy: r.recorded_by,
+          createdAt: r.created_at,
+        })),
+      });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /topical_application_records/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Topical application records are not available yet. Run backend/sql/025_topical_application_records.sql in Supabase and retry.'
+          );
+        }
+      }
+      logRequestError(req, err, 'topical-applications-list');
+      clientError(req, res, 500, 'Unable to load topical application records.');
+    }
+  }
+);
+
+app.post(
+  '/api/v1/residents/:id/topical-applications',
+  requireRole(ROLES_DAILY_CARE_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+
+    const medicationName =
+      typeof body.medicationName === 'string'
+        ? body.medicationName.trim()
+        : typeof body.medication_name === 'string'
+          ? body.medication_name.trim()
+          : '';
+    const medicationIdRaw = body.medicationId ?? body.medication_id ?? null;
+    const siteNotes =
+      typeof body.siteNotes === 'string'
+        ? body.siteNotes.trim()
+        : typeof body.site_notes === 'string'
+          ? body.site_notes.trim()
+          : '';
+    const batchLot =
+      typeof body.batchLot === 'string'
+        ? body.batchLot.trim()
+        : typeof body.batch_lot === 'string'
+          ? body.batch_lot.trim()
+          : '';
+    const dateRaw = body.date ?? body.chartDate ?? body.chart_date ?? null;
+    const appliedAtRaw = body.appliedAt ?? body.applied_at ?? null;
+
+    const regions = normalizeTopicalBodyRegions(body.bodyRegions ?? body.body_regions);
+    if (!medicationName || medicationName.length > 300) {
+      return clientError(req, res, 400, 'medicationName is required (max 300 characters).');
+    }
+    if (regions.length === 0) {
+      return clientError(req, res, 400, 'Select at least one body region on the map.');
+    }
+    if (siteNotes.length > 2000) return clientError(req, res, 400, 'siteNotes is too long.');
+    if (batchLot.length > 120) return clientError(req, res, 400, 'batchLot is too long.');
+
+    let chartDate = null;
+    if (dateRaw) {
+      const s = String(dateRaw);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return clientError(req, res, 400, 'date must be YYYY-MM-DD.');
+      chartDate = s;
+    }
+
+    let appliedAt = null;
+    if (appliedAtRaw) {
+      const d = new Date(String(appliedAtRaw));
+      if (Number.isNaN(d.getTime())) return clientError(req, res, 400, 'appliedAt must be a valid ISO date/time.');
+      appliedAt = d.toISOString();
+    }
+
+    let medicationId = null;
+    if (medicationIdRaw != null && String(medicationIdRaw).trim() !== '') {
+      const mid = String(medicationIdRaw).trim();
+      if (!UUID_RE.test(mid)) return clientError(req, res, 400, 'medicationId must be a UUID when provided.');
+      medicationId = mid;
+    }
+
+    try {
+      const scopeCheck = await pool.query(
+        `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (scopeCheck.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+
+      if (medicationId) {
+        const mv = await pool.query(
+          `SELECT id FROM medications WHERE id = $1::uuid AND service_user_id = $2::uuid LIMIT 1`,
+          [medicationId, id]
+        );
+        if (mv.rows.length === 0) {
+          return clientError(req, res, 400, 'medicationId does not match a medication for this service user.');
+        }
+      }
+
+      const recordedBy =
+        (req.dbUser?.first_name || req.dbUser?.last_name)
+          ? `${req.dbUser?.first_name || ''} ${req.dbUser?.last_name || ''}`.trim()
+          : (req.dbUser?.email ?? req.user?.email ?? null);
+
+      const ins = await pool.query(
+        `INSERT INTO topical_application_records
+          (service_user_id, chart_date, applied_at, medication_name, medication_id, body_regions, site_notes, batch_lot, recorded_by)
+         VALUES ($1::uuid, COALESCE($2::date, (now() AT TIME ZONE 'utc')::date), COALESCE($3::timestamptz, now()),
+                 $4, $5::uuid, $6::text[], NULLIF($7, ''), NULLIF($8, ''), $9)
+         RETURNING *`,
+        [id, chartDate, appliedAt, medicationName, medicationId, regions, siteNotes, batchLot, recordedBy]
+      );
+
+      const row = ins.rows[0];
+      await writeAuditLog(req, {
+        action: 'TOPICAL_APPLICATION_CREATE',
+        resourceType: 'topical_application_record',
+        resourceId: row?.id ?? null,
+        metadata: {
+          serviceUserId: id,
+          regionCount: regions.length,
+          chartDate: row?.chart_date ?? null,
+        },
+      });
+
+      res.status(201).json({
+        success: true,
+        entry: {
+          id: row.id,
+          chartDate: row.chart_date,
+          appliedAt: row.applied_at,
+          medicationName: row.medication_name,
+          medicationId: row.medication_id,
+          bodyRegions: row.body_regions || [],
+          siteNotes: row.site_notes,
+          batchLot: row.batch_lot,
+          recordedBy: row.recorded_by,
+          createdAt: row.created_at,
+        },
+      });
+    } catch (err) {
+      if (err && typeof err === 'object' && ('code' in err || 'message' in err)) {
+        const code = err.code;
+        const msg = err.message || '';
+        if (code === '42P01' || /topical_application_records/i.test(String(msg))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Topical application records are not available yet. Run backend/sql/025_topical_application_records.sql in Supabase and retry.'
+          );
+        }
+        if (code === '23503') {
+          return clientError(req, res, 400, 'Invalid medication reference.');
+        }
+      }
+      logRequestError(req, err, 'topical-applications-create');
+      clientError(req, res, 500, 'Could not save topical application record.');
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
 // PEEP (PERSONAL EMERGENCY EVACUATION PLAN) — SCOPED
 // ---------------------------------------------------------------------------
 app.get(
@@ -5682,6 +6486,289 @@ app.get(
     logRequestError(req, err, 'facility-layout');
     clientError(req, res, 500, 'Unable to load facility layout. Please try again later.');
   }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// COMMUNAL BATHROOM — weekly deep clean checklist (per home)
+// ---------------------------------------------------------------------------
+const COMMUNAL_BATHROOM_CHECKLIST_DEF = [
+  { key: 'tile_walls_shower', label: 'Wall tiles & shower enclosure', hint: 'Scrub; remove soap residue and limescale.' },
+  { key: 'grout_seals', label: 'Grout & silicone seals', hint: 'Inspect for mould/damage; clean or flag maintenance.' },
+  { key: 'bath_shower_tray', label: 'Bath / shower tray', hint: 'Descale, disinfect, rinse thoroughly.' },
+  { key: 'toilet_full', label: 'Toilet (full deep clean)', hint: 'Bowl, rim, seat, hinges, exterior, behind pan where reachable.' },
+  { key: 'sinks_taps', label: 'Sinks & taps', hint: 'Descale outlets; polish metalware; clear overflow channels.' },
+  { key: 'mirrors_glass', label: 'Mirrors & glass', hint: 'Streak-free clean; check for cracks.' },
+  { key: 'floor_mop_disinfect', label: 'Floors — mop & disinfect', hint: 'Behind doors, corners, under furniture edges.' },
+  { key: 'drains_traps', label: 'Drains & traps', hint: 'Clear hair/debris; check flow; note odours.' },
+  { key: 'extractor_fan', label: 'Extractor / ventilation', hint: 'Clean cover/grille; confirm operation.' },
+  { key: 'bins_sanitised', label: 'Bins & clinical waste points', hint: 'Sanitise; fresh liners; lids functioning.' },
+  { key: 'consumables_restock', label: 'Consumables restocked', hint: 'Soap, paper, hand towels, toilet rolls per home policy.' },
+  { key: 'high_touch_surfaces', label: 'High-touch surfaces', hint: 'Door handles, rails, flush plates, light switches.' },
+  { key: 'equipment_storage', label: 'Equipment & storage', hint: 'Hoists / shower chairs / commodes stored clean and dry.' },
+  { key: 'final_inspection', label: 'Final visual inspection', hint: 'Odour, slip hazards, lighting; sign-off ready.' },
+];
+
+const COMMUNAL_BATHROOM_CHECK_KEYS = new Set(COMMUNAL_BATHROOM_CHECKLIST_DEF.map((d) => d.key));
+
+function mondayOfWeekLocalFromDate(d) {
+  const t = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const day = t.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  t.setDate(t.getDate() + diff);
+  const yyyy = t.getFullYear();
+  const mm = String(t.getMonth() + 1).padStart(2, '0');
+  const dd = String(t.getDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function parseWeekStartMondayParam(raw) {
+  if (raw == null || raw === '') return mondayOfWeekLocalFromDate(new Date());
+  const s = String(raw).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const d = new Date(`${s}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return null;
+  return mondayOfWeekLocalFromDate(d);
+}
+
+function actorDisplayName(req) {
+  const fn = req.dbUser?.first_name || '';
+  const ln = req.dbUser?.last_name || '';
+  const n = `${fn} ${ln}`.trim();
+  return n || req.dbUser?.email || req.user?.email || 'Staff';
+}
+
+function sanitizeCommunalChecklistIncoming(raw) {
+  if (!raw || typeof raw !== 'object') return {};
+  const out = {};
+  for (const key of COMMUNAL_BATHROOM_CHECK_KEYS) {
+    const v = raw[key];
+    if (!v || typeof v !== 'object') continue;
+    out[key] = { done: Boolean(v.done) };
+  }
+  return out;
+}
+
+function mergeCommunalChecklistPersistence(existingJson, incomingSanitized, req) {
+  const existing = existingJson && typeof existingJson === 'object' ? existingJson : {};
+  const actor = actorDisplayName(req);
+  const out = {};
+  for (const key of COMMUNAL_BATHROOM_CHECK_KEYS) {
+    const want = incomingSanitized[key];
+    const nowDone = want && want.done;
+    if (!nowDone) {
+      out[key] = { done: false };
+      continue;
+    }
+    const prev = existing[key];
+    if (prev && prev.done === true && prev.at) {
+      out[key] = { done: true, at: String(prev.at), by: String(prev.by || actor).slice(0, 200) };
+    } else {
+      out[key] = { done: true, at: new Date().toISOString(), by: actor.slice(0, 200) };
+    }
+  }
+  return out;
+}
+
+async function resolveCommunalCleanHomeId(req, queryHomeId) {
+  const scope = userHomeScope(req);
+  if (scope != null) {
+    return { ok: true, homeId: String(scope) };
+  }
+  const hid = queryHomeId != null ? String(queryHomeId).trim() : '';
+  if (!hid || !UUID_RE.test(hid)) {
+    return { ok: false, message: 'homeId query parameter is required when your account is not scoped to a single home.' };
+  }
+  return { ok: true, homeId: hid };
+}
+
+app.get(
+  '/api/v1/facility/communal-bathroom-weekly-clean',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const scope = userHomeScope(req);
+    const weekRaw = req.query?.weekStart ?? req.query?.week_start;
+    const weekStart = parseWeekStartMondayParam(weekRaw);
+    if (!weekStart) {
+      return clientError(req, res, 400, 'weekStart must be YYYY-MM-DD (Monday of the week you are recording).');
+    }
+
+    const homeRes = await resolveCommunalCleanHomeId(req, req.query?.homeId ?? req.query?.home_id);
+    if (!homeRes.ok) {
+      return clientError(req, res, 400, homeRes.message);
+    }
+    const { homeId } = homeRes;
+
+    try {
+      const hk = await pool.query(
+        `SELECT id, name FROM homes WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR id = CAST($2 AS uuid)) LIMIT 1`,
+        [homeId, scope]
+      );
+      if (hk.rows.length === 0) {
+        return clientError(req, res, 403, 'Home not found or not in your scope.');
+      }
+
+      let row = null;
+      try {
+        const r = await pool.query(
+          `SELECT * FROM communal_bathroom_weekly_checks WHERE home_id = $1::uuid AND week_start_monday = $2::date LIMIT 1`,
+          [homeId, weekStart]
+        );
+        row = r.rows[0] || null;
+      } catch (e) {
+        if (String(e.code || '') === '42P01' || /communal_bathroom_weekly_checks/i.test(String(e.message))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Communal bathroom weekly checklist is not available yet. Run backend/sql/026_communal_bathroom_weekly_clean.sql in Supabase and retry.'
+          );
+        }
+        throw e;
+      }
+
+      const state = row?.checklist_state && typeof row.checklist_state === 'object' ? row.checklist_state : {};
+      const items = COMMUNAL_BATHROOM_CHECKLIST_DEF.map((def) => {
+        const s = state[def.key] && typeof state[def.key] === 'object' ? state[def.key] : {};
+        return {
+          ...def,
+          done: Boolean(s.done),
+          completedAt: s.at || null,
+          completedBy: s.by || null,
+        };
+      });
+
+      await writeAuditLog(req, {
+        action: 'COMMUNAL_BATHROOM_WEEKLY_CLEAN_VIEW',
+        resourceType: 'facility',
+        resourceId: homeId,
+        metadata: { weekStart, hasSavedRow: Boolean(row) },
+      });
+
+      res.json({
+        home: hk.rows[0],
+        weekStartMonday: weekStart,
+        templateVersion: 1,
+        items,
+        supervisorNotes: row?.supervisor_notes ?? null,
+        updatedAt: row?.updated_at ?? null,
+        updatedBy: row?.updated_by ?? null,
+      });
+    } catch (err) {
+      logRequestError(req, err, 'communal-bathroom-weekly-clean-get');
+      clientError(req, res, 500, 'Unable to load communal bathroom weekly checklist.');
+    }
+  }
+);
+
+app.put(
+  '/api/v1/facility/communal-bathroom-weekly-clean',
+  requireRole(ROLES_DAILY_CARE_WRITE),
+  async (req, res) => {
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+    const weekRaw = body.weekStartMonday ?? body.week_start_monday ?? body.weekStart;
+    const weekStart = parseWeekStartMondayParam(weekRaw);
+    if (!weekStart) {
+      return clientError(req, res, 400, 'weekStartMonday must be YYYY-MM-DD (Monday of the week).');
+    }
+
+    const homeRes = await resolveCommunalCleanHomeId(req, body.homeId ?? body.home_id ?? req.query?.homeId);
+    if (!homeRes.ok) {
+      return clientError(req, res, 400, homeRes.message);
+    }
+    const { homeId } = homeRes;
+
+    const supervisorNotes =
+      typeof body.supervisorNotes === 'string'
+        ? body.supervisorNotes.trim()
+        : typeof body.supervisor_notes === 'string'
+          ? body.supervisor_notes.trim()
+          : '';
+    if (supervisorNotes.length > 2000) {
+      return clientError(req, res, 400, 'supervisorNotes is too long.');
+    }
+
+    const incoming = sanitizeCommunalChecklistIncoming(body.checklistState ?? body.checklist_state);
+
+    try {
+      const hk = await pool.query(
+        `SELECT id FROM homes WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR id = CAST($2 AS uuid)) LIMIT 1`,
+        [homeId, scope]
+      );
+      if (hk.rows.length === 0) {
+        return clientError(req, res, 403, 'Home not found or not in your scope.');
+      }
+
+      let existingState = {};
+      try {
+        const ex = await pool.query(
+          `SELECT checklist_state FROM communal_bathroom_weekly_checks WHERE home_id = $1::uuid AND week_start_monday = $2::date LIMIT 1`,
+          [homeId, weekStart]
+        );
+        if (ex.rows[0]?.checklist_state && typeof ex.rows[0].checklist_state === 'object') {
+          existingState = ex.rows[0].checklist_state;
+        }
+      } catch (e) {
+        if (String(e.code || '') === '42P01' || /communal_bathroom_weekly_checks/i.test(String(e.message))) {
+          return clientError(
+            req,
+            res,
+            503,
+            'Communal bathroom weekly checklist is not available yet. Run backend/sql/026_communal_bathroom_weekly_clean.sql in Supabase and retry.'
+          );
+        }
+        throw e;
+      }
+
+      const merged = mergeCommunalChecklistPersistence(existingState, incoming, req);
+      const updater = actorDisplayName(req);
+
+      const up = await pool.query(
+        `INSERT INTO communal_bathroom_weekly_checks (home_id, week_start_monday, checklist_state, supervisor_notes, updated_by)
+         VALUES ($1::uuid, $2::date, $3::jsonb, NULLIF($4, ''), $5)
+         ON CONFLICT (home_id, week_start_monday)
+         DO UPDATE SET
+           checklist_state = EXCLUDED.checklist_state,
+           supervisor_notes = EXCLUDED.supervisor_notes,
+           updated_by = EXCLUDED.updated_by,
+           updated_at = now()
+         RETURNING *`,
+        [homeId, weekStart, JSON.stringify(merged), supervisorNotes, updater]
+      );
+
+      const row = up.rows[0];
+      await writeAuditLog(req, {
+        action: 'COMMUNAL_BATHROOM_WEEKLY_CLEAN_SAVE',
+        resourceType: 'facility',
+        resourceId: homeId,
+        metadata: { weekStart, doneCount: Object.values(merged).filter((x) => x && x.done).length },
+      });
+
+      const state = row.checklist_state && typeof row.checklist_state === 'object' ? row.checklist_state : {};
+      const items = COMMUNAL_BATHROOM_CHECKLIST_DEF.map((def) => {
+        const s = state[def.key] && typeof state[def.key] === 'object' ? state[def.key] : {};
+        return {
+          ...def,
+          done: Boolean(s.done),
+          completedAt: s.at || null,
+          completedBy: s.by || null,
+        };
+      });
+
+      res.json({
+        success: true,
+        homeId,
+        weekStartMonday: weekStart,
+        items,
+        supervisorNotes: row.supervisor_notes ?? null,
+        updatedAt: row.updated_at,
+        updatedBy: row.updated_by,
+      });
+    } catch (err) {
+      logRequestError(req, err, 'communal-bathroom-weekly-clean-put');
+      clientError(req, res, 500, 'Could not save communal bathroom weekly checklist.');
+    }
   }
 );
 
