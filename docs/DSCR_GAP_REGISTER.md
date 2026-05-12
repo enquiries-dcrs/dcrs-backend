@@ -59,7 +59,7 @@ This register uses **NHS England — Core capabilities for digital social care r
 | DSCR-C5-01 | **5 — Data sharing with other systems** | Export data and reports in flat-file formats (e.g., PDF). | **Evidence:** PDF accepted as uploads. **Gap:** **Server-generated** assurance PDFs for reports largely **absent**; analytics placeholders reference PDF without implementation. | High | N | Y | 0.x |
 | DSCR-C5-02 | **5 — Data sharing…** | Export data and reports in interrogatable/importable formats (e.g., CSV). | **Evidence:** Resident exports, audit CSV, roster CSV, UTF-8 BOM. **Gap:** Not every managerial report exists as CSV yet. | Med | Y | Y | MVP |
 | DSCR-C5-03 | **5 — Data sharing…** | Upload documents into an individual's care record. | **Evidence:** Resident document upload API + UI. **Gap:** Operational virus scan / retention. | Med | Y | Y | MVP |
-| DSCR-C5-04 | **5 — Data sharing…** | Produce key information for emergency hospital admissions in a compliant format. | **Evidence:** PEEP + clinical exports fragments. **Gap:** No named **standard** emergency admission / transfer dataset + pack (e.g. national transfer requirements). | Crit | N | Y | 1.0 |
+| DSCR-C5-04 | **5 — Data sharing…** | Produce key information for emergency hospital admissions in a compliant format. | **Evidence:** `dcrs.emergencyTransferPack` v1: `GET /api/v1/residents/:id/emergency-transfer-pack` (+ `.csv`); identity, allergies text, MAR-style medication list, recent observations, active care plan titles, PEEP (when table exists), GP/NOK/advance-care profile fields (`022_emergency_transfer_profile.sql`); Overview UI edit + downloads; existing PEEP + timeline CSV exports. **Gap:** Not a **national NHS** interoperability message (e.g. ePRF / FHIR Admission-Transfer); homes must still use trust-specific forms and statutory advance decision paperwork where required. | Med | Y | Y | MVP |
 | DSCR-C5-05 | **5 — Data sharing…** | *(Implied by category title)* Live interoperability with other digital systems. | **Evidence:** UI/settings references; demo GP-style data. **Gap:** **Production** FHIR/GP Connect/ADT etc. **not** implemented. | Crit | N | N | 1.0 |
 | DSCR-C6-01 | **6 — Operation and management of a care setting** | Generating, saving, and amending pre-built summary reports for individual recipients. | **Evidence:** CSV exports + AI assist. **Gap:** No **saved/amendable report definitions** catalogue per recipient. | High | N | Y | 1.0 |
 | DSCR-C6-02 | **6 — Operation…** | Generating, saving, and amending pre-built summary reports at a site and service level. | **Evidence:** Analytics KPIs, roster CSV, placeholders. **Gap:** No site/service **report library** with versioning/amend workflow. | High | N | Y | 0.x |
@@ -69,6 +69,8 @@ This register uses **NHS England — Core capabilities for digital social care r
 **Note:** DSCR-C5-05 is the **category-level** interoperability expectation; keep it explicit so procurement Q&A does not assume CSV alone satisfies “other systems.”
 
 **Family portal / visit requests (engineering SoT):** apply `backend/sql/020_family_portal.sql` (`family_portal_access`, `daily_notes.share_with_family`) and `backend/sql/021_family_visit_requests.sql` in production DBs; without these, related API routes return explicit migration errors.
+
+**Emergency transfer pack:** apply `backend/sql/022_emergency_transfer_profile.sql` so resident chart loads include GP/NOK/allergy profile columns; pack JSON still builds without PEEP if that migration is missing.
 
 ---
 

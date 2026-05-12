@@ -265,6 +265,21 @@ function taskPriorityIsHigh(p) {
   return s === 'high' || s === 'critical';
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function filterValidUuidList(ids) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of ids) {
+    if (raw == null) continue;
+    const s = String(raw).trim();
+    if (!UUID_RE.test(s) || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
 function normalizeTaskRow(t) {
   if (!t || typeof t !== 'object') return t;
   const due =
@@ -533,8 +548,16 @@ const ROLES_ASSESSMENT_TEMPLATES_EDIT = ['Deputy Manager', 'Home Manager', 'Regi
 const ROLES_ASSESSMENTS_CREATE = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_RESIDENT_DOCUMENTS_UPLOAD = ['Senior Carer', 'Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 const ROLES_RESIDENT_DOCUMENTS_DELETE = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
-/** Clinical record CSV export (governance / handover evidence). */
+/** Clinical record CSV export + assurance pack + emergency transfer pack (governance). */
 const ROLES_RESIDENT_RECORD_EXPORT = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+/** Who may edit emergency transfer profile fields on the service user. */
+const ROLES_EMERGENCY_TRANSFER_PROFILE_WRITE = [
+  'Senior Carer',
+  'Deputy Manager',
+  'Home Manager',
+  'Regional Manager',
+  'Admin',
+];
 
 /** Family portal: read-only updates for linked relatives (provisioned `users` row, role Family). */
 const ROLES_ADMIN_FAMILY_LINK = ['Regional Manager', 'Admin', 'Home Manager'];
@@ -2344,6 +2367,376 @@ app.get('/api/v1/residents/:id/export.csv', requireRole(ROLES_RESIDENT_RECORD_EX
   }
 });
 
+/**
+ * DCRS emergency / hospital transfer pack (standard v1).
+ * Aligns with UK practice: identity, allergies, meds, recent vitals, PEEP, GP/NOK, advance care pointers.
+ * Not a national NHS message schema — structured JSON/CSV for ambulance and acute handover.
+ */
+async function assembleEmergencyTransferPack(req, serviceUserId, scope) {
+  const suq = await pool.query(
+    `SELECT su.id, su.first_name, su.last_name, su.date_of_birth, su.nhs_number, su.status, su.legal_hold,
+            su.known_allergies, su.gp_practice_name, su.gp_practice_phone,
+            su.next_of_kin_name, su.next_of_kin_phone, su.next_of_kin_relationship,
+            su.advance_care_notes,
+            h.name AS home_name, h.id AS home_id, b.room_number, u.name AS unit_name
+     FROM service_users su
+     LEFT JOIN beds b ON su.current_bed_id = b.id
+     LEFT JOIN units u ON b.unit_id = u.id
+     LEFT JOIN homes h ON su.home_id = h.id
+     WHERE su.id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))`,
+    [serviceUserId, scope]
+  );
+  if (suq.rows.length === 0) {
+    const err = new Error('NOT_FOUND');
+    err.code = 'ENOTFOUND';
+    throw err;
+  }
+  const su = suq.rows[0];
+
+  const [medsRes, obsRes, plansRes, noteCountRes] = await Promise.all([
+    pool.query(
+      `SELECT m.id, m.name, m.dose, m.route, m.frequency, m.stock_count
+       FROM medications m
+       INNER JOIN service_users su2 ON su2.id = m.service_user_id
+       WHERE m.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su2.home_id = CAST($2 AS uuid))
+       ORDER BY m.name ASC NULLS LAST`,
+      [serviceUserId, scope]
+    ),
+    pool.query(
+      `SELECT o.id, o.observation_type, o.value, o.unit, o.recorded_at, o.recorded_by_name, o.notes
+       FROM observations o
+       INNER JOIN service_users su2 ON su2.id = o.service_user_id
+       WHERE o.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su2.home_id = CAST($2 AS uuid))
+       ORDER BY o.recorded_at DESC NULLS LAST
+       LIMIT 25`,
+      [serviceUserId, scope]
+    ),
+    pool.query(
+      `SELECT cp.title, cp.status, cp.updated_at
+       FROM care_plans cp
+       INNER JOIN service_users su2 ON su2.id = cp.service_user_id
+       WHERE cp.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su2.home_id = CAST($2 AS uuid))
+         AND cp.status = 'ACTIVE'
+       ORDER BY cp.updated_at DESC NULLS LAST
+       LIMIT 8`,
+      [serviceUserId, scope]
+    ),
+    pool.query(
+      `SELECT COUNT(*)::int AS c FROM daily_notes dn
+       INNER JOIN service_users su2 ON su2.id = dn.service_user_id
+       WHERE dn.service_user_id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su2.home_id = CAST($2 AS uuid))
+         AND dn.created_at >= NOW() - INTERVAL '72 hours'`,
+      [serviceUserId, scope]
+    ),
+  ]);
+
+  let peep = null;
+  try {
+    const peepRes = await pool.query(
+      `SELECT mobility, assistance_required, evacuation_method, communication_needs, equipment_required, key_risks, route_and_refuge, other_notes, review_date, updated_at
+       FROM peep_documents WHERE service_user_id = $1::uuid`,
+      [serviceUserId]
+    );
+    if (peepRes.rows && peepRes.rows.length > 0) {
+      const p = peepRes.rows[0];
+      peep = {
+        mobility: p.mobility,
+        assistanceRequired: p.assistance_required,
+        evacuationMethod: p.evacuation_method,
+        communicationNeeds: p.communication_needs,
+        equipmentRequired: p.equipment_required,
+        keyRisks: p.key_risks,
+        routeAndRefuge: p.route_and_refuge,
+        otherNotes: p.other_notes,
+        reviewDate: p.review_date,
+        updatedAt: p.updated_at,
+      };
+    }
+  } catch (e) {
+    const code = e && typeof e === 'object' ? e.code : null;
+    const msg = e && typeof e === 'object' ? String(e.message || '') : '';
+    if (code !== '42P01' && !/peep_documents/i.test(msg)) {
+      logRequestError(req, e, 'emergency-transfer-pack-peep');
+    }
+  }
+
+  const medications = (medsRes.rows || []).map((m) => ({
+    id: m.id,
+    name: m.name,
+    dose: m.dose,
+    route: m.route,
+    frequency: m.frequency,
+    stockCount: m.stock_count,
+  }));
+
+  const recentObservations = (obsRes.rows || []).map((o) => ({
+    id: o.id,
+    type: o.observation_type,
+    value: o.value,
+    unit: o.unit,
+    recordedAt: o.recorded_at ? new Date(o.recorded_at).toISOString() : null,
+    recordedBy: o.recorded_by_name || null,
+    notes: o.notes ? oneLine(o.notes).slice(0, 500) : null,
+  }));
+
+  const activeCarePlans = (plansRes.rows || []).map((r) => ({
+    title: r.title,
+    status: r.status,
+    updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+  }));
+
+  return {
+    standardId: 'dcrs.emergencyTransferPack',
+    standardVersion: 1,
+    generatedAt: new Date().toISOString(),
+    disclaimer:
+      'DCRS emergency transfer pack v1: operational handover aid for UK social care. Not a substitute for NHS e-Referral, ambulance ePRF, or trust-specific acute documentation. Verify medications and allergies against the original MAR and clinical records before transfer. Advance care information is indicative only — follow local policy and statutory forms (e.g. RESPECT, DNACPR) held on file.',
+    identity: {
+      serviceUserId: su.id,
+      givenName: su.first_name,
+      familyName: su.last_name,
+      dateOfBirth: su.date_of_birth ? new Date(su.date_of_birth).toISOString().slice(0, 10) : null,
+      nhsNumber: su.nhs_number || null,
+      legalHold: Boolean(su.legal_hold),
+      residentStatus: su.status,
+      careHomeName: su.home_name || null,
+      homeId: su.home_id || null,
+      roomNumber: su.room_number || null,
+      unitName: su.unit_name || null,
+    },
+    allergiesAndAlerts: {
+      knownAllergies: su.known_allergies ? String(su.known_allergies).trim() : null,
+    },
+    medications,
+    recentObservations,
+    carePlanning: {
+      activeCarePlans,
+    },
+    mobilityAndEvacuation: {
+      peep,
+    },
+    contacts: {
+      gpPracticeName: su.gp_practice_name ? String(su.gp_practice_name).trim() : null,
+      gpPracticePhone: su.gp_practice_phone ? String(su.gp_practice_phone).trim() : null,
+      nextOfKinName: su.next_of_kin_name ? String(su.next_of_kin_name).trim() : null,
+      nextOfKinPhone: su.next_of_kin_phone ? String(su.next_of_kin_phone).trim() : null,
+      nextOfKinRelationship: su.next_of_kin_relationship ? String(su.next_of_kin_relationship).trim() : null,
+    },
+    advanceCare: {
+      notes: su.advance_care_notes ? String(su.advance_care_notes).trim() : null,
+    },
+    communicationAndHandover: {
+      dailyNotesRecordedLast72h: noteCountRes.rows[0]?.c ?? 0,
+    },
+  };
+}
+
+function flattenEmergencyTransferPackToCsvRows(pack) {
+  const rows = [];
+  const meta = (field, value) => rows.push(['meta', field, value == null ? '' : String(value)]);
+  meta('standardId', pack.standardId);
+  meta('standardVersion', pack.standardVersion);
+  meta('generatedAt', pack.generatedAt);
+  meta('disclaimer', pack.disclaimer);
+  const walk = (prefix, obj) => {
+    if (obj == null) return;
+    if (Array.isArray(obj)) {
+      obj.forEach((item, i) => {
+        if (item && typeof item === 'object') walk(`${prefix}[${i}]`, item);
+        else rows.push(['data', `${prefix}[${i}]`, item == null ? '' : String(item)]);
+      });
+      return;
+    }
+    if (typeof obj === 'object') {
+      for (const [k, v] of Object.entries(obj)) {
+        const p = prefix ? `${prefix}.${k}` : k;
+        if (v == null) rows.push(['data', p, '']);
+        else if (typeof v === 'object') walk(p, v);
+        else rows.push(['data', p, String(v)]);
+      }
+    }
+  };
+  walk('identity', pack.identity);
+  walk('allergiesAndAlerts', pack.allergiesAndAlerts);
+  walk('medications', pack.medications);
+  walk('recentObservations', pack.recentObservations);
+  walk('carePlanning', pack.carePlanning);
+  walk('mobilityAndEvacuation', pack.mobilityAndEvacuation);
+  walk('contacts', pack.contacts);
+  walk('advanceCare', pack.advanceCare);
+  walk('communicationAndHandover', pack.communicationAndHandover);
+  return rows;
+}
+
+app.get(
+  '/api/v1/residents/:id/emergency-transfer-pack',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    try {
+      const pack = await assembleEmergencyTransferPack(req, id, scope);
+      await writeAuditLog(req, {
+        action: 'EMERGENCY_TRANSFER_PACK_VIEW',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: {
+          medCount: pack.medications?.length ?? 0,
+          obsCount: pack.recentObservations?.length ?? 0,
+          hasPeep: Boolean(pack.mobilityAndEvacuation?.peep),
+        },
+      });
+      res.json(pack);
+    } catch (err) {
+      if (err && err.code === '42703') {
+        return clientError(
+          req,
+          res,
+          503,
+          'Emergency transfer profile requires database migration 022_emergency_transfer_profile.sql to be applied.'
+        );
+      }
+      if (err && err.code === 'ENOTFOUND') {
+        return clientError(req, res, 404, 'Resident not found or access denied.');
+      }
+      logRequestError(req, err, 'emergency-transfer-pack');
+      clientError(req, res, 500, 'Unable to build emergency transfer pack.');
+    }
+  }
+);
+
+app.get(
+  '/api/v1/residents/:id/emergency-transfer-pack.csv',
+  requireRole(ROLES_RESIDENT_AND_FACILITY_READ),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    try {
+      const pack = await assembleEmergencyTransferPack(req, id, scope);
+      const lines = ['\ufeff'];
+      lines.push(csvLine(['row_type', 'field_path', 'value']));
+      for (const r of flattenEmergencyTransferPackToCsvRows(pack)) {
+        lines.push(csvLine(r));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="emergency-transfer-pack-${id}-${new Date().toISOString().slice(0, 10)}.csv"`
+      );
+      await writeAuditLog(req, {
+        action: 'EMERGENCY_TRANSFER_PACK_EXPORT_CSV',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { csvLineCount: lines.length },
+      });
+      res.status(200).send(lines.join('\n'));
+    } catch (err) {
+      if (err && err.code === '42703') {
+        return clientError(
+          req,
+          res,
+          503,
+          'Emergency transfer profile requires database migration 022_emergency_transfer_profile.sql to be applied.'
+        );
+      }
+      if (err && err.code === 'ENOTFOUND') {
+        return clientError(req, res, 404, 'Resident not found or access denied.');
+      }
+      logRequestError(req, err, 'emergency-transfer-pack-csv');
+      clientError(req, res, 500, 'Unable to export emergency transfer pack CSV.');
+    }
+  }
+);
+
+app.patch(
+  '/api/v1/residents/:id/emergency-transfer-profile',
+  requireRole(ROLES_EMERGENCY_TRANSFER_PROFILE_WRITE),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+    const trimStr = (v, max) => {
+      if (v === undefined) return undefined;
+      if (v === null) return null;
+      if (typeof v !== 'string') return undefined;
+      return v.trim().slice(0, max);
+    };
+
+    const map = {
+      knownAllergies: { col: 'known_allergies', max: 4000 },
+      gpPracticeName: { col: 'gp_practice_name', max: 500 },
+      gpPracticePhone: { col: 'gp_practice_phone', max: 80 },
+      nextOfKinName: { col: 'next_of_kin_name', max: 200 },
+      nextOfKinPhone: { col: 'next_of_kin_phone', max: 80 },
+      nextOfKinRelationship: { col: 'next_of_kin_relationship', max: 120 },
+      advanceCareNotes: { col: 'advance_care_notes', max: 4000 },
+    };
+
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    for (const [key, { col, max }] of Object.entries(map)) {
+      if (!Object.prototype.hasOwnProperty.call(body, key)) continue;
+      const t = trimStr(body[key], max);
+      if (t === undefined) continue;
+      sets.push(`${col} = $${i++}`);
+      vals.push(t);
+    }
+    if (sets.length === 0) {
+      return clientError(
+        req,
+        res,
+        400,
+        'Provide at least one of: knownAllergies, gpPracticeName, gpPracticePhone, nextOfKinName, nextOfKinPhone, nextOfKinRelationship, advanceCareNotes (strings or null).'
+      );
+    }
+
+    vals.push(id, scope);
+    try {
+      const up = await pool.query(
+        `UPDATE service_users su SET ${sets.join(', ')}
+         WHERE su.id = $${i}::uuid AND (CAST($${i + 1} AS uuid) IS NULL OR su.home_id = CAST($${i + 1} AS uuid))
+         RETURNING su.id, su.known_allergies, su.gp_practice_name, su.gp_practice_phone,
+                   su.next_of_kin_name, su.next_of_kin_phone, su.next_of_kin_relationship, su.advance_care_notes`,
+        vals
+      );
+      if (up.rows.length === 0) {
+        return clientError(req, res, 403, 'Resident not found or access denied.');
+      }
+      const r = up.rows[0];
+      await writeAuditLog(req, {
+        action: 'EMERGENCY_TRANSFER_PROFILE_UPDATE',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { fieldsUpdated: sets.length },
+      });
+      res.json({
+        success: true,
+        emergencyTransferProfile: {
+          knownAllergies: r.known_allergies,
+          gpPracticeName: r.gp_practice_name,
+          gpPracticePhone: r.gp_practice_phone,
+          nextOfKinName: r.next_of_kin_name,
+          nextOfKinPhone: r.next_of_kin_phone,
+          nextOfKinRelationship: r.next_of_kin_relationship,
+          advanceCareNotes: r.advance_care_notes,
+        },
+      });
+    } catch (err) {
+      if (err && err.code === '42703') {
+        return clientError(
+          req,
+          res,
+          503,
+          'Emergency transfer profile requires database migration 022_emergency_transfer_profile.sql to be applied.'
+        );
+      }
+      logRequestError(req, err, 'emergency-transfer-profile-patch');
+      clientError(req, res, 500, 'Could not update emergency transfer profile.');
+    }
+  }
+);
+
 // ---------------------------------------------------------------------------
 // 2. GET SINGLE RESIDENT (SCOPED)
 // ---------------------------------------------------------------------------
@@ -2355,7 +2748,7 @@ app.get(
   const scope = userHomeScope(req);
 
   try {
-    const residentQuery = `
+    const residentQueryBase = `
       SELECT 
         su.id, su.first_name, su.last_name, su.date_of_birth, su.nhs_number, su.status, su.legal_hold,
         su.profile_image_url,
@@ -2366,7 +2759,42 @@ app.get(
       LEFT JOIN homes h ON su.home_id = h.id
       WHERE su.id = $1 AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
     `;
-    const residentResult = await pool.query(residentQuery, [id, scope]);
+    const residentQueryWithEmergency = `
+      SELECT 
+        su.id, su.first_name, su.last_name, su.date_of_birth, su.nhs_number, su.status, su.legal_hold,
+        su.profile_image_url,
+        su.known_allergies, su.gp_practice_name, su.gp_practice_phone,
+        su.next_of_kin_name, su.next_of_kin_phone, su.next_of_kin_relationship,
+        su.advance_care_notes,
+        b.room_number, u.name as unit_name, h.name as home_name
+      FROM service_users su
+      LEFT JOIN beds b ON su.current_bed_id = b.id
+      LEFT JOIN units u ON b.unit_id = u.id
+      LEFT JOIN homes h ON su.home_id = h.id
+      WHERE su.id = $1 AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+    `;
+
+    let residentResult;
+    try {
+      residentResult = await pool.query(residentQueryWithEmergency, [id, scope]);
+    } catch (firstErr) {
+      if (firstErr && firstErr.code === '42703') {
+        residentResult = await pool.query(residentQueryBase, [id, scope]);
+        if (residentResult.rows[0]) {
+          Object.assign(residentResult.rows[0], {
+            known_allergies: null,
+            gp_practice_name: null,
+            gp_practice_phone: null,
+            next_of_kin_name: null,
+            next_of_kin_phone: null,
+            next_of_kin_relationship: null,
+            advance_care_notes: null,
+          });
+        }
+      } else {
+        throw firstErr;
+      }
+    }
 
     if (residentResult.rows.length === 0) {
       return res.status(404).json({ error: 'Resident not found or access denied' });
@@ -2401,15 +2829,24 @@ app.get(
         AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
       ORDER BY o.recorded_at DESC`;
 
-    const [tasksRes, notesRes, medsRes, obsRes] = await Promise.all([
+    // Load child tables independently so a missing migration on one chart (e.g. observations)
+    // does not 500 the entire clinical record.
+    const childTags = ['tasks', 'notes', 'medications', 'observations'];
+    const settled = await Promise.allSettled([
       pool.query(tasksQuery, [id, scope]),
       pool.query(notesQuery, [id, scope]),
       pool.query(medsQuery, [id, scope]),
       pool.query(obsQuery, [id, scope]),
     ]);
+    const rowsAt = (i) => {
+      const r = settled[i];
+      if (r.status === 'fulfilled') return r.value.rows || [];
+      logRequestError(req, r.reason, `resident-detail-${childTags[i]}`);
+      return [];
+    };
 
-    const taskRows = tasksRes.rows || [];
-    const assignIds = [...new Set(taskRows.map((r) => r.assigned_to).filter(Boolean))];
+    const taskRows = rowsAt(0);
+    const assignIds = filterValidUuidList(taskRows.map((r) => r.assigned_to));
     let assignNameById = {};
     if (assignIds.length) {
       try {
@@ -2431,22 +2868,24 @@ app.get(
         nm ? { ...r, assigned_first_name: nm.first_name, assigned_last_name: nm.last_name } : r
       );
     });
-    resident.dailyNotes = notesRes.rows.map((n) => ({
+    resident.dailyNotes = rowsAt(1).map((n) => ({
       id: n.id,
-      text: n.note_text,
-      time: new Date(n.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      text: n.note_text != null ? String(n.note_text) : '',
+      time: n.created_at
+        ? new Date(n.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : '',
       author: n.author_name || 'Staff',
       shareWithFamily: Boolean(n.share_with_family),
     }));
-    resident.medications = medsRes.rows.map((m) => ({
+    resident.medications = rowsAt(2).map((m) => ({
       id: m.id,
-      name: m.name,
-      dose: m.dose,
-      frequency: m.frequency,
-      route: m.route,
-      stockCount: m.stock_count,
+      name: m.name != null ? String(m.name) : '',
+      dose: m.dose != null ? String(m.dose) : '',
+      frequency: m.frequency != null ? String(m.frequency) : '',
+      route: m.route != null ? String(m.route) : '',
+      stockCount: Number(m.stock_count != null ? m.stock_count : 0) || 0,
     }));
-    resident.observations = obsRes.rows.map((o) => mapObservationRow(o));
+    resident.observations = rowsAt(3).map((o) => mapObservationRow(o));
     resident.documents = [];
 
     await writeAuditLog(req, {
@@ -4406,7 +4845,7 @@ app.get('/api/v1/tasks', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (r
       LIMIT 300
     `;
     const { rows } = await pool.query(q, [scope]);
-    const inboxAssignIds = [...new Set(rows.map((r) => r.assigned_to).filter(Boolean))];
+    const inboxAssignIds = filterValidUuidList(rows.map((r) => r.assigned_to));
     let inboxAssignNameById = {};
     if (inboxAssignIds.length) {
       try {
