@@ -816,6 +816,159 @@ app.get('/api/v1/family/residents/:id/feed', requireFamilyPortalActor, async (re
   }
 });
 
+/** YYYY-MM-DD calendar date in UTC; returns null if invalid. */
+function parsePreferredVisitDateUtc(isoDay) {
+  const s = typeof isoDay === 'string' ? isoDay.trim() : '';
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const da = Number(m[3]);
+  const t = Date.UTC(y, mo - 1, da);
+  if (Number.isNaN(t)) return null;
+  const d = new Date(t);
+  if (d.getUTCFullYear() !== y || d.getUTCMonth() !== mo - 1 || d.getUTCDate() !== da) return null;
+  return { isoDay: s, utcMidnight: t };
+}
+
+app.post('/api/v1/family/residents/:id/visit-request', requireFamilyPortalActor, async (req, res) => {
+  const { id: residentId } = req.params;
+  try {
+    if (req.dbUser?.system_role !== 'Family') {
+      return clientError(req, res, 403, 'Only family accounts can submit visit requests.');
+    }
+    if (!(await userCanViewResidentInFamilyPortal(req, residentId))) {
+      return clientError(req, res, 403, 'You do not have access to this resident on the family portal.');
+    }
+
+    const body = req.body || {};
+    const preferredRaw = body.preferredDate ?? body.preferred_date;
+    const preferredParsed = parsePreferredVisitDateUtc(
+      typeof preferredRaw === 'string' ? preferredRaw : preferredRaw != null ? String(preferredRaw) : ''
+    );
+    if (!preferredParsed) {
+      return clientError(req, res, 400, 'preferredDate is required and must be YYYY-MM-DD.');
+    }
+
+    const now = new Date();
+    const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    if (preferredParsed.utcMidnight < todayUtc) {
+      return clientError(req, res, 400, 'preferredDate must be today or a future date.');
+    }
+    if (preferredParsed.utcMidnight > todayUtc + 370 * 86400000) {
+      return clientError(req, res, 400, 'preferredDate is too far in the future.');
+    }
+
+    const timeNoteRaw = body.preferredTimeNote ?? body.preferred_time_note;
+    const timeNote =
+      typeof timeNoteRaw === 'string' ? timeNoteRaw.trim().slice(0, 120) : '';
+    const messageRaw = body.message;
+    const message = typeof messageRaw === 'string' ? messageRaw.trim().slice(0, 2000) : '';
+
+    const fn = String(req.dbUser.first_name || '').trim();
+    const ln = String(req.dbUser.last_name || '').trim();
+    const who = [fn, ln].filter(Boolean).join(' ') || 'Family contact';
+    const dateLabel = new Date(preferredParsed.utcMidnight).toLocaleDateString('en-GB', {
+      day: 'numeric',
+      month: 'short',
+      year: 'numeric',
+      timeZone: 'UTC',
+    });
+    let taskTitle = `Family visit request: ${who} — ${dateLabel}`;
+    if (timeNote) taskTitle += ` (${timeNote})`;
+    if (message) taskTitle += ` — ${message.replace(/\s+/g, ' ').trim()}`;
+    taskTitle = taskTitle.slice(0, 200);
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      let vrRow;
+      try {
+        const vr = await client.query(
+          `INSERT INTO family_visit_requests (service_user_id, requested_by_user_id, preferred_date, preferred_time_note, message)
+           VALUES ($1::uuid, $2::uuid, $3::date, $4, $5)
+           RETURNING id, created_at`,
+          [
+            residentId,
+            req.dbUser.id,
+            preferredParsed.isoDay,
+            timeNote || null,
+            message || null,
+          ]
+        );
+        vrRow = vr.rows[0];
+      } catch (err) {
+        if (err && err.code === '42P01') {
+          await client.query('ROLLBACK');
+          return clientError(
+            req,
+            res,
+            503,
+            'Visit requests require database migration 021_family_visit_requests.sql to be applied.'
+          );
+        }
+        throw err;
+      }
+
+      let taskRow;
+      try {
+        const ins = await client.query(
+          `INSERT INTO tasks (service_user_id, title, status, priority, due_date, assigned_to)
+           VALUES ($1::uuid, $2, 'Open', $3, $4::date, NULL)
+           RETURNING id`,
+          [residentId, taskTitle, normalizeTaskPriorityForDb('High'), preferredParsed.isoDay]
+        );
+        taskRow = ins.rows[0];
+      } catch (eIns) {
+        const code = eIns && typeof eIns === 'object' ? eIns.code : null;
+        const msg = eIns && typeof eIns === 'object' ? String(eIns.message || '') : '';
+        const missingAssignCol = code === '42703' || /assigned_to/i.test(msg);
+        if (!missingAssignCol) throw eIns;
+        const ins2 = await client.query(
+          `INSERT INTO tasks (service_user_id, title, status, priority, due_date)
+           VALUES ($1::uuid, $2, 'Open', $3, $4::date)
+           RETURNING id`,
+          [residentId, taskTitle, normalizeTaskPriorityForDb('High'), preferredParsed.isoDay]
+        );
+        taskRow = ins2.rows[0];
+      }
+
+      await client.query('COMMIT');
+
+      await writeAuditLog(req, {
+        action: 'FAMILY_VISIT_REQUEST_CREATE',
+        resourceType: 'family_visit_request',
+        resourceId: vrRow.id,
+        metadata: {
+          serviceUserId: residentId,
+          preferredDate: preferredParsed.isoDay,
+          taskId: taskRow.id,
+        },
+      });
+
+      return res.status(201).json({
+        success: true,
+        visitRequestId: vrRow.id,
+        taskId: taskRow.id,
+        createdAt: vrRow.created_at,
+      });
+    } catch (e) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (_rb) {
+        /* ignore */
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    logRequestError(req, err, 'family-visit-request');
+    clientError(req, res, 500, 'Could not submit visit request. Please try again later.');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // AI SAFETY: Disabled in production by default
 // ---------------------------------------------------------------------------
@@ -1210,6 +1363,286 @@ function computePeriodRange(period) {
   return { fromTs: from.toISOString(), toTs, label: 'Last 7 days' };
 }
 
+/** Home scope for analytics CSV / assurance pack (matches roster export rules). */
+async function resolveAnalyticsHomeFilter(req) {
+  const scope = userHomeScope(req);
+  const homeIdRaw = typeof req.query?.homeId === 'string' ? req.query.homeId.trim() : '';
+  if (scope != null) {
+    const filterHomeId = scope;
+    if (homeIdRaw && homeIdRaw.toUpperCase() !== 'ALL') {
+      if (String(homeIdRaw).replace(/-/g, '').toLowerCase() !== String(scope).replace(/-/g, '').toLowerCase()) {
+        return { ok: false, status: 403, message: 'You can only export residents for your assigned home.' };
+      }
+    }
+    return { ok: true, filterHomeId };
+  }
+  if (!homeIdRaw || homeIdRaw.toUpperCase() === 'ALL') {
+    return { ok: true, filterHomeId: null };
+  }
+  if (!/^[0-9a-f-]{36}$/i.test(homeIdRaw)) {
+    return { ok: false, status: 400, message: 'homeId must be a UUID, or omit / use ALL for all homes.' };
+  }
+  const hk = await pool.query(`SELECT id FROM homes WHERE id = $1::uuid`, [homeIdRaw]);
+  if (hk.rows.length === 0) return { ok: false, status: 404, message: 'Home not found.' };
+  return { ok: true, filterHomeId: homeIdRaw };
+}
+
+/** Manager-grade assurance metrics grouped for CQC *quality statement* themes (evidence prompts, not ratings). */
+async function buildAssurancePackPayload(req, filterHomeId, { fromTs, toTs, label }) {
+  const h = filterHomeId;
+  const q3 = [fromTs, toTs, h];
+
+  const intOrNull = (v) => (v == null ? null : Number(v));
+
+  const runCount = async (sql, params, tag) => {
+    try {
+      const r = await pool.query(sql, params);
+      return intOrNull(r.rows[0]?.count);
+    } catch (err) {
+      logRequestError(req, err, tag);
+      return null;
+    }
+  };
+
+  const [
+    notesCreated,
+    observationsRecorded,
+    activitiesRecorded,
+    assessmentsCreated,
+    documentsUploaded,
+    carePlansActive,
+    tasksOpen,
+    tasksOpenOverdue,
+    tasksCompletedInPeriod,
+    auditRows,
+    auditNonSuccess,
+    auditFamilyEvents,
+    auditResidentExports,
+    staffUsersActive,
+    familyPortalLinks,
+    familyVisitRequests,
+  ] = await Promise.all([
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.daily_notes dn
+       INNER JOIN public.service_users su ON su.id = dn.service_user_id
+       WHERE dn.created_at >= $1::timestamptz AND dn.created_at < $2::timestamptz
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+      q3,
+      'assurance-notes'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.observations o
+       INNER JOIN public.service_users su ON su.id = o.service_user_id
+       WHERE o.recorded_at >= $1::timestamptz AND o.recorded_at < $2::timestamptz
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+      q3,
+      'assurance-obs'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.activity_entries ae
+       INNER JOIN public.service_users su ON su.id = ae.service_user_id
+       WHERE COALESCE(ae.created_at, ae.chart_date::timestamptz) >= $1::timestamptz
+         AND COALESCE(ae.created_at, ae.chart_date::timestamptz) < $2::timestamptz
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+      q3,
+      'assurance-act'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.assessments a
+       INNER JOIN public.service_users su ON su.id = a.service_user_id
+       WHERE a.created_at >= $1::timestamptz AND a.created_at < $2::timestamptz
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+      q3,
+      'assurance-asmt'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.resident_documents d
+       INNER JOIN public.service_users su ON su.id = d.service_user_id
+       WHERE d.is_deleted = false AND d.uploaded_at >= $1::timestamptz AND d.uploaded_at < $2::timestamptz
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+      q3,
+      'assurance-docs'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.care_plans cp
+       INNER JOIN public.service_users su ON su.id = cp.service_user_id
+       WHERE cp.status = 'ACTIVE' AND su.status = 'ADMITTED'
+         AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))`,
+      [h],
+      'assurance-plans'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.tasks t
+       INNER JOIN public.service_users su ON su.id = t.service_user_id
+       WHERE LOWER(TRIM(COALESCE(t.status, ''))) NOT IN ('completed', 'done', 'cancelled', 'closed')
+         AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))`,
+      [h],
+      'assurance-tasks-open'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.tasks t
+       INNER JOIN public.service_users su ON su.id = t.service_user_id
+       WHERE LOWER(TRIM(COALESCE(t.status, ''))) NOT IN ('completed', 'done', 'cancelled', 'closed')
+         AND t.due_date IS NOT NULL AND t.due_date::date < (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date
+         AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))`,
+      [h],
+      'assurance-tasks-od'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.tasks t
+       INNER JOIN public.service_users su ON su.id = t.service_user_id
+       WHERE LOWER(TRIM(COALESCE(t.status, ''))) IN ('completed', 'done')
+         AND COALESCE(t.updated_at, t.created_at) >= $1::timestamptz AND COALESCE(t.updated_at, t.created_at) < $2::timestamptz
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+      q3,
+      'assurance-tasks-done'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.audit_logs
+       WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz`,
+      [fromTs, toTs],
+      'assurance-audit-all'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.audit_logs
+       WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz AND outcome <> 'SUCCESS'`,
+      [fromTs, toTs],
+      'assurance-audit-fail'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.audit_logs
+       WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz AND action LIKE 'FAMILY_%'`,
+      [fromTs, toTs],
+      'assurance-audit-family'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.audit_logs
+       WHERE occurred_at >= $1::timestamptz AND occurred_at < $2::timestamptz
+         AND (action LIKE 'RESIDENT_%EXPORT%' OR action IN ('ANALYTICS_RESIDENT_ROSTER_EXPORT_CSV', 'ANALYTICS_ASSURANCE_PACK_EXPORT_CSV'))`,
+      [fromTs, toTs],
+      'assurance-audit-export'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.users
+       WHERE is_active = true AND COALESCE(system_role, '') <> 'Family'
+         AND (CAST($1 AS uuid) IS NULL OR home_scope_id IS NULL OR home_scope_id = CAST($1 AS uuid))`,
+      [h],
+      'assurance-staff'
+    ),
+    runCount(
+      `SELECT COUNT(*)::int AS count FROM public.family_portal_access f
+       INNER JOIN public.service_users su ON su.id = f.service_user_id
+       WHERE (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))`,
+      [h],
+      'assurance-fpa'
+    ),
+    (async () => {
+      try {
+        return await runCount(
+          `SELECT COUNT(*)::int AS count FROM public.family_visit_requests v
+           INNER JOIN public.service_users su ON su.id = v.service_user_id
+           WHERE v.created_at >= $1::timestamptz AND v.created_at < $2::timestamptz
+             AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))`,
+          q3,
+          'assurance-fvr'
+        );
+      } catch (err) {
+        if (err && err.code === '42P01') return null;
+        logRequestError(req, err, 'assurance-fvr');
+        return null;
+      }
+    })(),
+  ]);
+
+  let homeLabel = 'All homes (estate)';
+  if (h) {
+    try {
+      const hn = await pool.query(`SELECT name FROM public.homes WHERE id = $1::uuid`, [h]);
+      homeLabel = hn.rows[0]?.name ? String(hn.rows[0].name) : `Home ${h}`;
+    } catch (e) {
+      logRequestError(req, e, 'assurance-home-name');
+      homeLabel = `Home ${h}`;
+    }
+  }
+
+  const mk = (key, label, value, unit = 'count', hint = '') => ({ key, label, value, unit, hint });
+
+  const domains = [
+    {
+      id: 'safe',
+      title: 'Safe',
+      cqcPrompt:
+        'Evidence prompts: harm prevention, medicines governance, infection control, accidents, safeguarding culture (map local incidents to your SAB process).',
+      indicators: [
+        mk('observations_recorded', 'Structured observations recorded', observationsRecorded, 'count', 'Vitals and clinical observations in period.'),
+        mk('tasks_open', 'Open tasks (current snapshot)', tasksOpen, 'count', 'Outstanding work items for residents in scope.'),
+        mk('tasks_open_overdue', 'Open tasks past due date', tasksOpenOverdue, 'count', 'Review allocation and escalation.'),
+        mk('documents_uploaded', 'Resident documents uploaded', documentsUploaded, 'count', 'Letters, MAR charts on file, etc.'),
+      ],
+    },
+    {
+      id: 'effective',
+      title: 'Effective',
+      cqcPrompt:
+        'Evidence prompts: care outcomes, assessments, nutrition/hydration, clinical tasks completed, care planning currency.',
+      indicators: [
+        mk('assessments_created', 'Assessments recorded (period)', assessmentsCreated, 'count', 'Template-based assessments created.'),
+        mk('care_plans_active', 'Active care plans (admitted residents)', carePlansActive, 'count', 'Snapshot — plans with status ACTIVE.'),
+        mk('tasks_completed_period', 'Tasks completed (period)', tasksCompletedInPeriod, 'count', 'Requires tasks.updated_at or created_at.'),
+      ],
+    },
+    {
+      id: 'caring',
+      title: 'Caring',
+      cqcPrompt:
+        'Evidence prompts: dignity, compassion, daily life engagement, involvement of people who use the service.',
+      indicators: [
+        mk('daily_notes_created', 'Daily notes created (period)', notesCreated, 'count', 'Includes all notes; triangulate with quality audits.'),
+        mk('activities_recorded', 'Activity entries recorded (period)', activitiesRecorded, 'count', 'Social and meaningful activity.'),
+      ],
+    },
+    {
+      id: 'responsive',
+      title: 'Responsive',
+      cqcPrompt:
+        'Evidence prompts: personalised care, complaints, end-of-life wishes, family partnership.',
+      indicators: [
+        mk('family_portal_links', 'Family portal access links (snapshot)', familyPortalLinks, 'count', 'Linked family user ↔ resident rows.'),
+        mk(
+          'family_visit_requests',
+          'Family visit requests (period)',
+          familyVisitRequests,
+          'count',
+          familyVisitRequests == null ? 'Requires migration 021_family_visit_requests.sql.' : ''
+        ),
+        mk('family_related_audit_events', 'Family-related audit events (period)', auditFamilyEvents, 'count', 'Feed views, invites, etc. (audit action prefix FAMILY_).'),
+      ],
+    },
+    {
+      id: 'well_led',
+      title: 'Well-led',
+      cqcPrompt:
+        'Evidence prompts: governance, assurance, learning culture, oversight of access and exports.',
+      indicators: [
+        mk('audit_events_total', 'Audit log rows (period, system-wide)', auditRows, 'count', 'Includes all homes; filter exports by home in your SIEM if required.'),
+        mk('audit_non_success', 'Audit rows with non-SUCCESS outcome', auditNonSuccess, 'count', 'Investigate failures and access denials.'),
+        mk('resident_record_exports', 'Record / roster / assurance CSV export events (period)', auditResidentExports, 'count', 'Resident CSV exports, roster CSV, and CQC assurance pack CSV downloads.'),
+        mk('staff_users_active', 'Active non-family user accounts (snapshot)', staffUsersActive, 'count', 'Scoped by home_scope_id when a home is selected.'),
+      ],
+    },
+  ];
+
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    period: { label, from: fromTs, to: toTs },
+    home: { filterHomeId: h, label: homeLabel },
+    disclaimer:
+      'This assurance pack groups operational metrics under CQC quality statement themes (Safe, Effective, Caring, Responsive, Well-led) as evidence prompts for registered managers and governance leads. It does not predict inspection ratings, replace statutory notifications (CQC, safeguarding, etc.), or satisfy every Key Line of Enquiry. Use with professional judgement, local policies, and your Data Protection Impact Assessment.',
+    domains,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Audit trail export (governance evidence) — Regional Manager / Admin only
 // ---------------------------------------------------------------------------
@@ -1363,34 +1796,88 @@ app.get('/api/v1/analytics/summary', requireRole(ROLES_RESIDENT_AND_FACILITY_REA
   }
 });
 
+app.get('/api/v1/analytics/assurance-pack', requireRole(ROLES_RESIDENT_RECORD_EXPORT), async (req, res) => {
+  try {
+    const resolved = await resolveAnalyticsHomeFilter(req);
+    if (!resolved.ok) return clientError(req, res, resolved.status, resolved.message);
+    const period = computePeriodRange(req.query.period);
+    const payload = await buildAssurancePackPayload(req, resolved.filterHomeId, period);
+    await writeAuditLog(req, {
+      action: 'ANALYTICS_ASSURANCE_PACK_VIEW',
+      resourceType: 'analytics',
+      resourceId: resolved.filterHomeId,
+      metadata: { periodLabel: period.label, domainCount: payload.domains?.length ?? 0 },
+    });
+    res.json(payload);
+  } catch (err) {
+    logRequestError(req, err, 'analytics-assurance-pack');
+    clientError(req, res, 500, 'Unable to build assurance pack.');
+  }
+});
+
+app.get('/api/v1/analytics/assurance-pack.csv', requireRole(ROLES_RESIDENT_RECORD_EXPORT), async (req, res) => {
+  try {
+    const resolved = await resolveAnalyticsHomeFilter(req);
+    if (!resolved.ok) return clientError(req, res, resolved.status, resolved.message);
+    const period = computePeriodRange(req.query.period);
+    const payload = await buildAssurancePackPayload(req, resolved.filterHomeId, period);
+
+    const lines = ['\ufeff'];
+    lines.push(csvLine(['section', 'field', 'value']));
+    lines.push(csvLine(['meta', 'schemaVersion', String(payload.schemaVersion)]));
+    lines.push(csvLine(['meta', 'generatedAt', payload.generatedAt]));
+    lines.push(csvLine(['meta', 'periodLabel', payload.period.label]));
+    lines.push(csvLine(['meta', 'periodFrom', payload.period.from]));
+    lines.push(csvLine(['meta', 'periodTo', payload.period.to]));
+    lines.push(csvLine(['meta', 'homeLabel', payload.home.label]));
+    lines.push(csvLine(['meta', 'filterHomeId', payload.home.filterHomeId || '']));
+    lines.push(csvLine(['meta', 'disclaimer', payload.disclaimer]));
+    lines.push('');
+    lines.push(csvLine(['domain_id', 'domain_title', 'indicator_key', 'indicator_label', 'value', 'unit', 'hint']));
+    for (const d of payload.domains || []) {
+      for (const ind of d.indicators || []) {
+        const val = ind.value == null ? '' : String(ind.value);
+        lines.push(
+          csvLine([
+            d.id,
+            d.title,
+            ind.key,
+            ind.label,
+            val,
+            ind.unit || 'count',
+            ind.hint || '',
+          ])
+        );
+      }
+    }
+
+    const slug = resolved.filterHomeId ? String(resolved.filterHomeId).slice(0, 8) : 'estate';
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="cqc-assurance-pack-${slug}-${new Date().toISOString().slice(0, 10)}.csv"`
+    );
+    await writeAuditLog(req, {
+      action: 'ANALYTICS_ASSURANCE_PACK_EXPORT_CSV',
+      resourceType: 'analytics',
+      resourceId: resolved.filterHomeId,
+      metadata: { periodLabel: period.label, rowCount: lines.length },
+    });
+    res.status(200).send(lines.join('\n'));
+  } catch (err) {
+    logRequestError(req, err, 'analytics-assurance-pack-csv');
+    clientError(req, res, 500, 'Unable to export assurance pack CSV.');
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Analytics — per-home (or estate) resident roster CSV
 // ---------------------------------------------------------------------------
 app.get('/api/v1/analytics/residents-export.csv', requireRole(ROLES_RESIDENT_RECORD_EXPORT), async (req, res) => {
-  const scope = userHomeScope(req);
-  const homeIdRaw = typeof req.query?.homeId === 'string' ? req.query.homeId.trim() : '';
-
-  let filterHomeId = null;
   try {
-    if (scope != null) {
-      filterHomeId = scope;
-      if (homeIdRaw && homeIdRaw.toUpperCase() !== 'ALL') {
-        if (String(homeIdRaw).replace(/-/g, '').toLowerCase() !== String(scope).replace(/-/g, '').toLowerCase()) {
-          return clientError(req, res, 403, 'You can only export residents for your assigned home.');
-        }
-      }
-    } else {
-      if (!homeIdRaw || homeIdRaw.toUpperCase() === 'ALL') {
-        filterHomeId = null;
-      } else {
-        if (!/^[0-9a-f-]{36}$/i.test(homeIdRaw)) {
-          return clientError(req, res, 400, 'homeId must be a UUID, or omit / use ALL for all homes.');
-        }
-        const hk = await pool.query(`SELECT id FROM homes WHERE id = $1::uuid`, [homeIdRaw]);
-        if (hk.rows.length === 0) return clientError(req, res, 404, 'Home not found.');
-        filterHomeId = homeIdRaw;
-      }
-    }
+    const resolved = await resolveAnalyticsHomeFilter(req);
+    if (!resolved.ok) return clientError(req, res, resolved.status, resolved.message);
+    const filterHomeId = resolved.filterHomeId;
 
     const { rows } = await pool.query(
       `SELECT su.id, su.first_name, su.last_name, su.date_of_birth, su.nhs_number, su.status, su.legal_hold,
