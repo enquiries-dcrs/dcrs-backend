@@ -536,6 +536,156 @@ const ROLES_RESIDENT_DOCUMENTS_DELETE = ['Deputy Manager', 'Home Manager', 'Regi
 /** Clinical record CSV export (governance / handover evidence). */
 const ROLES_RESIDENT_RECORD_EXPORT = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
 
+/** Family portal: read-only updates for linked relatives (provisioned `users` row, role Family). */
+const ROLES_ADMIN_FAMILY_LINK = ['Regional Manager', 'Admin', 'Home Manager'];
+/** Who may send Supabase invites for family contacts tied to a resident. */
+const ROLES_FAMILY_INVITE_SENDERS = ['Deputy Manager', 'Home Manager', 'Regional Manager', 'Admin'];
+
+function requireFamilyPortalActor(req, res, next) {
+  const r = req.dbUser?.system_role;
+  if (!r) {
+    return clientError(req, res, 403, 'Forbidden: Role could not be determined for this account.');
+  }
+  if (r === 'Family' || ROLES_RESIDENT_AND_FACILITY_READ.includes(r)) {
+    return next();
+  }
+  return clientError(req, res, 403, 'Forbidden: Family portal requires a Family or clinical staff account.');
+}
+
+async function userCanViewResidentInFamilyPortal(req, serviceUserId) {
+  const role = req.dbUser?.system_role;
+  if (!role) return false;
+  if (role === 'Family') {
+    const r = await pool.query(
+      `SELECT 1 FROM family_portal_access f
+       WHERE f.user_id = $1::uuid AND f.service_user_id = $2::uuid
+       LIMIT 1`,
+      [req.dbUser.id, serviceUserId]
+    );
+    return r.rows.length > 0;
+  }
+  if (ROLES_RESIDENT_AND_FACILITY_READ.includes(role)) {
+    const scope = userHomeScope(req);
+    const r = await pool.query(
+      `SELECT 1 FROM service_users su
+       WHERE su.id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR su.home_id = CAST($2 AS uuid))
+       LIMIT 1`,
+      [serviceUserId, scope]
+    );
+    return r.rows.length > 0;
+  }
+  return false;
+}
+
+async function assertAdminCanLinkFamilyToResident(req, serviceUserId) {
+  const role = req.dbUser?.system_role;
+  const scope = userHomeScope(req);
+  const h = await pool.query(`SELECT home_id FROM service_users WHERE id = $1::uuid`, [serviceUserId]);
+  if (!h.rows.length) return { ok: false, status: 404, message: 'Resident not found.' };
+  const homeId = h.rows[0].home_id;
+  if (role === 'Admin' || role === 'Regional Manager') return { ok: true };
+  if (role === 'Home Manager') {
+    if (scope && String(homeId) === String(scope)) return { ok: true };
+    return { ok: false, status: 403, message: 'That resident is outside your home scope.' };
+  }
+  return { ok: false, status: 403, message: 'Forbidden.' };
+}
+
+async function buildFamilyPortalFeed(req, serviceUserId) {
+  const items = [];
+  try {
+    const nq = await pool.query(
+      `SELECT id, note_text, author_name, created_at
+       FROM daily_notes
+       WHERE service_user_id = $1::uuid AND share_with_family = true
+       ORDER BY created_at DESC
+       LIMIT 40`,
+      [serviceUserId]
+    );
+    for (const n of nq.rows || []) {
+      items.push({
+        id: `note-${n.id}`,
+        kind: 'shared_note',
+        title: `Message from ${n.author_name || 'the care team'}`,
+        body: oneLine(n.note_text).slice(0, 4000),
+        occurredAt: n.created_at ? new Date(n.created_at).toISOString() : null,
+      });
+    }
+  } catch (err) {
+    if (err && err.code === '42703') {
+      // share_with_family column missing until migration 020 is applied
+    } else {
+      logRequestError(req, err, 'family-feed-notes');
+    }
+  }
+
+  try {
+    const aq = await pool.query(
+      `SELECT ae.id, ae.activity_type, ae.notes, ae.chart_date, ae.created_at, ae.recorded_by
+       FROM activity_entries ae
+       WHERE ae.service_user_id = $1::uuid
+       ORDER BY ae.created_at DESC
+       LIMIT 25`,
+      [serviceUserId]
+    );
+    for (const a of aq.rows || []) {
+      const at = a.created_at || a.chart_date;
+      const detail = a.notes
+        ? oneLine(a.notes).slice(0, 2000)
+        : `Recorded${a.recorded_by ? ` by ${a.recorded_by}` : ''}.`;
+      items.push({
+        id: `activity-${a.id}`,
+        kind: 'activity',
+        title: a.activity_type || 'Activity',
+        body: detail,
+        occurredAt: at ? new Date(at).toISOString() : null,
+      });
+    }
+  } catch (err) {
+    const code = err && err.code;
+    const msg = err && err.message ? String(err.message) : '';
+    if (code !== '42P01' && !/activity_entries/i.test(msg)) {
+      logRequestError(req, err, 'family-feed-activities');
+    }
+  }
+
+  try {
+    const dq = await pool.query(
+      `SELECT id, care_item, value, notes, chart_date, created_at, recorded_by
+       FROM daily_care_entries
+       WHERE service_user_id = $1::uuid
+         AND care_item IN ('Visitors','Been out','Stayed in')
+       ORDER BY created_at DESC
+       LIMIT 20`,
+      [serviceUserId]
+    );
+    for (const d of dq.rows || []) {
+      const at = d.created_at || d.chart_date;
+      const bits = [d.care_item, d.value, d.notes].filter(Boolean).join(' — ');
+      items.push({
+        id: `care-${d.id}`,
+        kind: 'daily_life',
+        title: d.care_item || 'Daily update',
+        body: oneLine(bits).slice(0, 2000),
+        occurredAt: at ? new Date(at).toISOString() : null,
+      });
+    }
+  } catch (err) {
+    const code = err && err.code;
+    const msg = err && err.message ? String(err.message) : '';
+    if (code !== '42P01' && !/daily_care_entries/i.test(msg)) {
+      logRequestError(req, err, 'family-feed-daily-care');
+    }
+  }
+
+  items.sort((a, b) => {
+    const ta = a.occurredAt ? new Date(a.occurredAt).getTime() : 0;
+    const tb = b.occurredAt ? new Date(b.occurredAt).getTime() : 0;
+    return tb - ta;
+  });
+  return items.filter((x) => x.occurredAt).slice(0, 60);
+}
+
 const residentDocUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
@@ -586,6 +736,87 @@ app.get('/api/v1/auth/me', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// FAMILY PORTAL (linked Family accounts + clinical preview)
+// ---------------------------------------------------------------------------
+app.get('/api/v1/family/context', requireFamilyPortalActor, async (req, res) => {
+  try {
+    const role = req.dbUser.system_role;
+    if (role === 'Family') {
+      try {
+        const { rows } = await pool.query(
+          `SELECT su.id AS service_user_id, su.first_name, su.last_name, h.name AS home_name, f.relationship
+           FROM family_portal_access f
+           INNER JOIN service_users su ON su.id = f.service_user_id
+           LEFT JOIN homes h ON h.id = su.home_id
+           WHERE f.user_id = $1::uuid
+           ORDER BY su.last_name ASC NULLS LAST, su.first_name ASC NULLS LAST`,
+          [req.dbUser.id]
+        );
+        return res.json({ role: 'Family', residents: rows });
+      } catch (err) {
+        if (err && err.code === '42P01') {
+          return clientError(
+            req,
+            res,
+            503,
+            'Family portal is not available until database migration 020_family_portal.sql is applied.'
+          );
+        }
+        throw err;
+      }
+    }
+
+    const scope = userHomeScope(req);
+    const { rows } = await pool.query(
+      `SELECT su.id AS service_user_id, su.first_name, su.last_name, h.name AS home_name, NULL::text AS relationship
+       FROM service_users su
+       LEFT JOIN beds b ON su.current_bed_id = b.id
+       LEFT JOIN units u ON b.unit_id = u.id
+       LEFT JOIN homes h ON su.home_id = h.id
+       WHERE su.status IN ('ADMITTED', 'DISCHARGED', 'PENDING')
+         AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
+       ORDER BY su.last_name ASC NULLS LAST, su.first_name ASC NULLS LAST`,
+      [scope]
+    );
+    return res.json({ role: 'staff', residents: rows });
+  } catch (err) {
+    logRequestError(req, err, 'family-context');
+    clientError(req, res, 500, 'Unable to load family portal context.');
+  }
+});
+
+app.get('/api/v1/family/residents/:id/feed', requireFamilyPortalActor, async (req, res) => {
+  const { id } = req.params;
+  try {
+    if (!(await userCanViewResidentInFamilyPortal(req, id))) {
+      return clientError(req, res, 403, 'You do not have access to this resident on the family portal.');
+    }
+    const rq = await pool.query(
+      `SELECT su.id, su.first_name, su.last_name, h.name AS home_name
+       FROM service_users su
+       LEFT JOIN homes h ON h.id = su.home_id
+       WHERE su.id = $1::uuid`,
+      [id]
+    );
+    if (rq.rows.length === 0) {
+      return res.status(404).json({ error: 'Resident not found.' });
+    }
+    const resident = rq.rows[0];
+    const feed = await buildFamilyPortalFeed(req, id);
+    await writeAuditLog(req, {
+      action: 'FAMILY_PORTAL_FEED_VIEW',
+      resourceType: 'service_user',
+      resourceId: id,
+      metadata: { itemCount: feed.length },
+    });
+    res.json({ resident, feed });
+  } catch (err) {
+    logRequestError(req, err, 'family-feed');
+    clientError(req, res, 500, 'Unable to load family portal updates.');
+  }
+});
+
+// ---------------------------------------------------------------------------
 // AI SAFETY: Disabled in production by default
 // ---------------------------------------------------------------------------
 const aiEnabled =
@@ -623,9 +854,10 @@ app.get('/api/v1/admin/users', requireRole(['Regional Manager', 'Admin']), async
 app.post(
   '/api/v1/admin/users/invite',
   inviteLimiter,
-  requireRole(['Regional Manager', 'Admin']),
+  requireRole(['Regional Manager', 'Admin', 'Home Manager', 'Deputy Manager']),
   async (req, res) => {
     const { email, firstName, lastName, role, homeScopeId } = req.body || {};
+    const actorRole = req.dbUser?.system_role;
 
     try {
       if (!supabaseAdmin) {
@@ -636,8 +868,23 @@ app.post(
         return res.status(400).json({ error: 'Missing email' });
       }
 
+      const roleToInvite = String(role || 'Carer').trim();
+      if (['Home Manager', 'Deputy Manager'].includes(actorRole)) {
+        if (roleToInvite !== 'Family') {
+          return clientError(
+            req,
+            res,
+            403,
+            'Only Regional Manager or Admin can invite staff accounts. Home and deputy managers may invite Family portal users only.'
+          );
+        }
+      }
+
       const normalizedEmail = String(email).trim().toLowerCase();
-      const scopeId = homeScopeId === 'ALL' ? null : homeScopeId || null;
+      let scopeId = homeScopeId === 'ALL' ? null : homeScopeId || null;
+      if (actorRole === 'Home Manager' && userHomeScope(req) != null) {
+        scopeId = userHomeScope(req);
+      }
 
       const appOrigin = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
       const inviteRedirectTo = `${appOrigin}/auth/callback`;
@@ -646,7 +893,7 @@ app.post(
         redirectTo: inviteRedirectTo,
         data: {
           full_name: `${firstName || ''} ${lastName || ''}`.trim(),
-          role: role || 'Carer',
+          role: roleToInvite,
           home_scope_id: scopeId,
         },
       });
@@ -662,14 +909,14 @@ app.post(
              first_name = EXCLUDED.first_name,
              last_name = EXCLUDED.last_name,
              is_active = true`,
-        [normalizedEmail, firstName || '', lastName || '', role || 'Carer', scopeId]
+        [normalizedEmail, firstName || '', lastName || '', roleToInvite, scopeId]
       );
 
       await writeAuditLog(req, {
         action: 'ADMIN_INVITE_USER',
         resourceType: 'user_email',
         resourceId: normalizedEmail,
-        metadata: { role: role || 'Carer', homeScopeAll: homeScopeId === 'ALL' },
+        metadata: { role: roleToInvite, homeScopeAll: homeScopeId === 'ALL' },
       });
       res.json({ success: true, user: data.user });
     } catch (err) {
@@ -715,6 +962,56 @@ app.put('/api/v1/admin/users/:id', requireRole(['Regional Manager', 'Admin']), a
   } catch (err) {
     logRequestError(req, err, 'admin-update-user');
     clientError(req, res, 500, 'Unable to update user. Please try again later.');
+  }
+});
+
+app.post('/api/v1/admin/family-portal-access', requireRole(ROLES_ADMIN_FAMILY_LINK), async (req, res) => {
+  const { email, serviceUserId, relationship } = req.body || {};
+  const emailNorm = typeof email === 'string' ? email.trim().toLowerCase() : '';
+  const suId = typeof serviceUserId === 'string' ? serviceUserId.trim() : '';
+  const rel = typeof relationship === 'string' ? relationship.trim().slice(0, 120) : null;
+
+  if (!emailNorm || !suId) {
+    return res.status(400).json({ error: 'email and serviceUserId are required.' });
+  }
+
+  try {
+    const gate = await assertAdminCanLinkFamilyToResident(req, suId);
+    if (!gate.ok) {
+      return res.status(gate.status).json({ error: gate.message });
+    }
+
+    const uq = await pool.query(`SELECT id FROM users WHERE lower(trim(email)) = lower(trim($1))`, [emailNorm]);
+    if (uq.rows.length === 0) {
+      return res.status(404).json({ error: 'No provisioned DCRS user exists for that email. Invite them first.' });
+    }
+    const targetUserId = uq.rows[0].id;
+
+    await pool.query(
+      `INSERT INTO family_portal_access (user_id, service_user_id, relationship)
+       VALUES ($1::uuid, $2::uuid, $3)
+       ON CONFLICT (user_id, service_user_id) DO UPDATE SET relationship = EXCLUDED.relationship`,
+      [targetUserId, suId, rel || null]
+    );
+
+    await writeAuditLog(req, {
+      action: 'ADMIN_FAMILY_PORTAL_LINK_UPSERT',
+      resourceType: 'family_portal_access',
+      resourceId: String(suId),
+      metadata: { targetEmail: emailNorm },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    if (err && err.code === '42P01') {
+      return clientError(
+        req,
+        res,
+        503,
+        'Family portal is not available until database migration 020_family_portal.sql is applied.'
+      );
+    }
+    logRequestError(req, err, 'admin-family-portal-access');
+    clientError(req, res, 500, 'Unable to save family portal link.');
   }
 });
 
@@ -1652,6 +1949,7 @@ app.get(
       text: n.note_text,
       time: new Date(n.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       author: n.author_name || 'Staff',
+      shareWithFamily: Boolean(n.share_with_family),
     }));
     resident.medications = medsRes.rows.map((m) => ({
       id: m.id,
@@ -1678,6 +1976,248 @@ app.get(
     logRequestError(req, err, 'resident-detail');
     clientError(req, res, 500, 'Unable to load resident record. Please try again later.');
   }
+  }
+);
+
+app.post('/api/v1/residents/:id/daily-notes', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { id } = req.params;
+  const scope = userHomeScope(req);
+  const body = req.body || {};
+  const text = typeof body.text === 'string' ? body.text.trim() : '';
+  const shareWithFamily = Boolean(body.shareWithFamily);
+
+  if (!text) {
+    return clientError(req, res, 400, 'text is required.');
+  }
+  if (text.length > 20000) {
+    return clientError(req, res, 400, 'text is too long.');
+  }
+
+  try {
+    const scopeCheck = await pool.query(
+      `SELECT id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+      [id, scope]
+    );
+    if (scopeCheck.rows.length === 0) {
+      return clientError(req, res, 403, 'Access denied to this resident');
+    }
+
+    const dbAuthorName = req.dbUser
+      ? `${req.dbUser.first_name || ''} ${req.dbUser.last_name || ''}`.trim() || req.dbUser.email
+      : 'Staff';
+
+    const ins = await pool.query(
+      `INSERT INTO daily_notes (service_user_id, note_text, author_name, share_with_family)
+       VALUES ($1::uuid, $2, $3, $4)
+       RETURNING id, note_text, author_name, created_at, share_with_family`,
+      [id, text, dbAuthorName, shareWithFamily]
+    );
+    const row = ins.rows[0];
+    await writeAuditLog(req, {
+      action: 'DAILY_NOTE_CREATE',
+      resourceType: 'daily_note',
+      resourceId: row?.id ?? null,
+      metadata: { serviceUserId: id, shareWithFamily },
+    });
+    res.status(201).json({
+      note: {
+        id: row.id,
+        text: row.note_text,
+        time: new Date(row.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        author: row.author_name || 'Staff',
+        shareWithFamily: Boolean(row.share_with_family),
+      },
+    });
+  } catch (err) {
+    if (err && err.code === '42703') {
+      return clientError(
+        req,
+        res,
+        503,
+        'Daily notes sharing requires migration 020_family_portal.sql (share_with_family column).'
+      );
+    }
+    logRequestError(req, err, 'daily-note-create');
+    clientError(req, res, 500, 'Could not save note.');
+  }
+});
+
+app.patch('/api/v1/residents/:id/daily-notes/:noteId', requireRole(ROLES_RESIDENT_AND_FACILITY_READ), async (req, res) => {
+  const { id, noteId } = req.params;
+  const scope = userHomeScope(req);
+  const shareWithFamily = req.body?.shareWithFamily;
+  if (typeof shareWithFamily !== 'boolean') {
+    return clientError(req, res, 400, 'shareWithFamily boolean is required.');
+  }
+
+  try {
+    const up = await pool.query(
+      `UPDATE daily_notes dn
+       SET share_with_family = $4
+       FROM service_users su
+       WHERE dn.id = $2::uuid
+         AND dn.service_user_id = $1::uuid
+         AND su.id = dn.service_user_id
+         AND (CAST($3 AS uuid) IS NULL OR su.home_id = CAST($3 AS uuid))
+       RETURNING dn.id, dn.note_text, dn.author_name, dn.created_at, dn.share_with_family`,
+      [id, noteId, scope, shareWithFamily]
+    );
+    if (up.rows.length === 0) {
+      return clientError(req, res, 404, 'Note not found or access denied.');
+    }
+    const row = up.rows[0];
+    await writeAuditLog(req, {
+      action: 'DAILY_NOTE_FAMILY_SHARE_UPDATE',
+      resourceType: 'daily_note',
+      resourceId: noteId,
+      metadata: { serviceUserId: id, shareWithFamily },
+    });
+    res.json({
+      note: {
+        id: row.id,
+        text: row.note_text,
+        time: new Date(row.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        author: row.author_name || 'Staff',
+        shareWithFamily: Boolean(row.share_with_family),
+      },
+    });
+  } catch (err) {
+    if (err && err.code === '42703') {
+      return clientError(
+        req,
+        res,
+        503,
+        'Daily notes sharing requires migration 020_family_portal.sql (share_with_family column).'
+      );
+    }
+    logRequestError(req, err, 'daily-note-patch');
+    clientError(req, res, 500, 'Could not update note.');
+  }
+});
+
+app.post(
+  '/api/v1/residents/:id/family-invite',
+  inviteLimiter,
+  requireRole(ROLES_FAMILY_INVITE_SENDERS),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+    const body = req.body || {};
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const firstName = typeof body.firstName === 'string' ? body.firstName.trim() : '';
+    const lastName = typeof body.lastName === 'string' ? body.lastName.trim() : '';
+    const relationship =
+      typeof body.relationship === 'string' ? body.relationship.trim().slice(0, 120) : '';
+
+    if (!email) {
+      return clientError(req, res, 400, 'email is required.');
+    }
+
+    try {
+      const su = await pool.query(
+        `SELECT id, home_id FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (su.rows.length === 0) {
+        return clientError(req, res, 403, 'Resident not found or outside your scope.');
+      }
+      const residentHomeId = su.rows[0].home_id;
+
+      const existing = await pool.query(
+        `SELECT id, system_role FROM users WHERE lower(trim(email)) = lower(trim($1))`,
+        [email]
+      );
+
+      if (existing.rows.length > 0) {
+        const u = existing.rows[0];
+        if (u.system_role !== 'Family') {
+          return clientError(
+            req,
+            res,
+            409,
+            'That email is already used for a staff-type login. Family contacts need a separate personal email.'
+          );
+        }
+        await pool.query(
+          `INSERT INTO family_portal_access (user_id, service_user_id, relationship)
+           VALUES ($1::uuid, $2::uuid, NULLIF($3, ''))
+           ON CONFLICT (user_id, service_user_id) DO UPDATE SET relationship = EXCLUDED.relationship`,
+          [u.id, id, relationship]
+        );
+        await writeAuditLog(req, {
+          action: 'FAMILY_PORTAL_LINK_EXISTING_USER',
+          resourceType: 'service_user',
+          resourceId: id,
+          metadata: { targetEmail: email },
+        });
+        return res.json({
+          success: true,
+          linkedExisting: true,
+          message: 'That person already has a family account. They can now see this resident on the family portal.',
+        });
+      }
+
+      if (!supabaseAdmin) {
+        return clientError(req, res, 500, 'Server misconfiguration. Contact support.');
+      }
+
+      const appOrigin = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
+      const inviteRedirectTo = `${appOrigin}/auth/callback`;
+
+      const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+        redirectTo: inviteRedirectTo,
+        data: {
+          full_name: `${firstName} ${lastName}`.trim(),
+          role: 'Family',
+          home_scope_id: residentHomeId,
+        },
+      });
+
+      if (error) throw error;
+
+      const ins = await pool.query(
+        `INSERT INTO users (email, password_hash, first_name, last_name, system_role, home_scope_id, is_active)
+         VALUES ($1, 'invite_pending', $2, $3, 'Family', $4::uuid, true)
+         RETURNING id`,
+        [email, firstName, lastName, residentHomeId]
+      );
+      const newUserId = ins.rows[0]?.id;
+      if (!newUserId) {
+        throw new Error('Failed to provision family user row');
+      }
+
+      await pool.query(
+        `INSERT INTO family_portal_access (user_id, service_user_id, relationship)
+         VALUES ($1::uuid, $2::uuid, NULLIF($3, ''))
+         ON CONFLICT (user_id, service_user_id) DO UPDATE SET relationship = EXCLUDED.relationship`,
+        [newUserId, id, relationship]
+      );
+
+      await writeAuditLog(req, {
+        action: 'FAMILY_CONTACT_INVITE_SENT',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { targetEmail: email },
+      });
+
+      res.status(201).json({
+        success: true,
+        linkedExisting: false,
+        user: data?.user ?? null,
+        message: 'Invitation email sent. They should use the link to set a password, then sign in at the family portal.',
+      });
+    } catch (err) {
+      if (err && err.code === '42P01') {
+        return clientError(
+          req,
+          res,
+          503,
+          'Family portal is not available until database migration 020_family_portal.sql is applied.'
+        );
+      }
+      logRequestError(req, err, 'resident-family-invite');
+      clientError(req, res, 500, 'Unable to send family invitation. Try again or contact support.');
+    }
   }
 );
 
@@ -4420,13 +4960,14 @@ app.post(
     await client.query('BEGIN');
     for (const op of operations) {
       if (op.type === 'ADD_NOTE') {
+        const share = Boolean(op.payload && op.payload.shareWithFamily);
         const ins = await client.query(
-          `INSERT INTO daily_notes (service_user_id, note_text, author_name)
-           SELECT $1::uuid, $2, $3
+          `INSERT INTO daily_notes (service_user_id, note_text, author_name, share_with_family)
+           SELECT $1::uuid, $2, $3, $5
            FROM service_users su
            WHERE su.id = $1::uuid
              AND (CAST($4 AS uuid) IS NULL OR su.home_id = CAST($4 AS uuid))`,
-          [op.payload.residentId, op.payload.text, dbAuthorName, scope]
+          [op.payload.residentId, op.payload.text, dbAuthorName, scope, share]
         );
         if (ins.rowCount === 0) {
           throw new Error('Access denied or resident not in scope for note insert');
