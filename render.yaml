@@ -1,18 +1,18 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
 #
-# Typical layout: Next.js on Vercel (frontend) + this API on Render (backend).
+# Connect this service to the *backend-only* GitHub repo (repository root = this app):
+#   https://github.com/enquiries-dcrs/dcrs-backend
+# Do not point Render at the monorepo root; publish `backend/` with:
+#   bash scripts/push-backend-subtree.sh   (from DCRS-App root)
+#
+# Typical layout: Next.js on Vercel (frontend) + this API on Render.
 #
 # Required secrets in the Render dashboard (Environment):
 #   DATABASE_URL, SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
 #
 # Vercel pairing (also set in Render):
-#   FRONTEND_URL = production Vercel URL, e.g. https://your-app.vercel.app  (no trailing slash)
-#   NEXT_PUBLIC_API_URL on Vercel must point to this service URL, e.g. https://dcrs-backend.onrender.com
-#
-# If you deploy from a monorepo whose root contains `backend/`, add under this service:
-#   rootDir: backend
-#
-# Repo (backend-only): https://github.com/enquiries-dcrs/dcrs-backend
+#   FRONTEND_URL = production Vercel URL (no trailing slash)
+#   NEXT_PUBLIC_API_URL on Vercel = this service URL, e.g. https://dcrs-backend.onrender.com
 
 services:
   - type: web
