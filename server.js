@@ -2374,6 +2374,11 @@ app.get(
   async (req, res) => {
   try {
     const scope = userHomeScope(req);
+    const includeArchived =
+      /^(1|true|yes)$/i.test(String(req.query?.includeArchived ?? req.query?.include_archived ?? '').trim());
+    const statusList = includeArchived
+      ? ['ADMITTED', 'DISCHARGED', 'PENDING', 'ARCHIVED']
+      : ['ADMITTED', 'DISCHARGED', 'PENDING'];
     const query = `
       SELECT 
         su.id, su.first_name, su.last_name, su.date_of_birth, su.nhs_number, su.status,
@@ -2383,14 +2388,14 @@ app.get(
       LEFT JOIN beds b ON su.current_bed_id = b.id
       LEFT JOIN units u ON b.unit_id = u.id
       LEFT JOIN homes h ON su.home_id = h.id
-      WHERE su.status IN ('ADMITTED', 'DISCHARGED', 'PENDING')
+      WHERE su.status = ANY($2::text[])
       AND (CAST($1 AS uuid) IS NULL OR su.home_id = CAST($1 AS uuid))
     `;
-    const result = await pool.query(query, [scope]);
+    const result = await pool.query(query, [scope, statusList]);
     await writeAuditLog(req, {
       action: 'RESIDENT_DIRECTORY_VIEW',
       resourceType: 'service_user',
-      metadata: { resultCount: result.rows.length },
+      metadata: { resultCount: result.rows.length, includeArchived },
     });
     res.json(result.rows);
   } catch (err) {
@@ -6865,6 +6870,49 @@ app.post(
     } catch (err) {
       logRequestError(req, err, 'resident-discharge');
       clientError(req, res, 500, 'Discharge could not be completed. Please try again later.');
+    }
+  }
+);
+
+app.post(
+  '/api/v1/residents/:id/archive',
+  requireRole(['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin']),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+
+    try {
+      const sel = await pool.query(
+        `SELECT id, status FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (sel.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+      const st = String(sel.rows[0].status || '').toUpperCase();
+      if (st === 'ARCHIVED') {
+        return clientError(req, res, 409, 'This service user is already archived.');
+      }
+      if (st !== 'DISCHARGED') {
+        return clientError(
+          req,
+          res,
+          409,
+          'Only discharged service users can be archived. Discharge them first, then archive.'
+        );
+      }
+
+      await pool.query(`UPDATE service_users SET status = 'ARCHIVED' WHERE id = $1::uuid`, [id]);
+      await writeAuditLog(req, {
+        action: 'RESIDENT_ARCHIVE',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { priorStatus: st },
+      });
+      res.json({ success: true, status: 'ARCHIVED' });
+    } catch (err) {
+      logRequestError(req, err, 'resident-archive');
+      clientError(req, res, 500, 'Could not archive this service user. Please try again later.');
     }
   }
 );
