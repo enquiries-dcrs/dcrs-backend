@@ -6576,8 +6576,14 @@ async function resolveCommunalCleanHomeId(req, queryHomeId) {
     return { ok: true, homeId: String(scope) };
   }
   const hid = queryHomeId != null ? String(queryHomeId).trim() : '';
-  if (!hid || !UUID_RE.test(hid)) {
-    return { ok: false, message: 'homeId query parameter is required when your account is not scoped to a single home.' };
+  if (!hid) {
+    return {
+      ok: false,
+      message: 'homeId query parameter is required when your account is not scoped to a single home.',
+    };
+  }
+  if (!UUID_RE.test(hid)) {
+    return { ok: false, message: 'homeId must be a valid UUID (check location scope or home picker).' };
   }
   return { ok: true, homeId: hid };
 }
