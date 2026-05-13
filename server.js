@@ -265,7 +265,8 @@ function taskPriorityIsHigh(p) {
   return s === 'high' || s === 'critical';
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+/** 8-4-4-4-12 hex — matches Postgres uuid text (incl. non-RFC fixture IDs). */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function filterValidUuidList(ids) {
   const out = [];
