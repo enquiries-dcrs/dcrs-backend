@@ -6918,6 +6918,41 @@ app.post(
 );
 
 app.post(
+  '/api/v1/residents/:id/unarchive',
+  requireRole(['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin']),
+  async (req, res) => {
+    const { id } = req.params;
+    const scope = userHomeScope(req);
+
+    try {
+      const sel = await pool.query(
+        `SELECT id, status FROM service_users WHERE id = $1::uuid AND (CAST($2 AS uuid) IS NULL OR home_id = CAST($2 AS uuid))`,
+        [id, scope]
+      );
+      if (sel.rows.length === 0) {
+        return clientError(req, res, 403, 'Access denied to this resident');
+      }
+      const st = String(sel.rows[0].status || '').toUpperCase();
+      if (st !== 'ARCHIVED') {
+        return clientError(req, res, 409, 'Only archived service users can be unarchived.');
+      }
+
+      await pool.query(`UPDATE service_users SET status = 'DISCHARGED' WHERE id = $1::uuid`, [id]);
+      await writeAuditLog(req, {
+        action: 'RESIDENT_UNARCHIVE',
+        resourceType: 'service_user',
+        resourceId: id,
+        metadata: { newStatus: 'DISCHARGED' },
+      });
+      res.json({ success: true, status: 'DISCHARGED' });
+    } catch (err) {
+      logRequestError(req, err, 'resident-unarchive');
+      clientError(req, res, 500, 'Could not unarchive this service user. Please try again later.');
+    }
+  }
+);
+
+app.post(
   '/api/v1/residents/:id/admit',
   requireRole(['Deputy Manager', 'Regional Manager', 'Home Manager', 'Admin']),
   async (req, res) => {
